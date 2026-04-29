@@ -1,0 +1,25 @@
+[package]
+name = "mindvault"
+version = "0.1.0"
+description = "MindVault - 本地知识库桌面客户端"
+authors = ["lulu1011-pro"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+walkdir = "2"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-global-shortcut = "2"
