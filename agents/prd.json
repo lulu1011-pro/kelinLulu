@@ -1,0 +1,165 @@
+{
+  "project": "MindVault",
+  "branchName": "main/mvp-core",
+  "description": "本地知识库桌面客户端MVP核心功能开发",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "搭建Electron/Tauri基础框架",
+      "description": "作为开发者，需要搭建可运行的基础桌面应用框架，支持窗口创建、IPC通信、文件系统访问",
+      "acceptanceCriteria": [
+        "应用可正常启动并显示主窗口",
+        "支持Windows/MacOS/Linux三平台构建",
+        "主进程与渲染进程IPC通信正常",
+        "TypeScript类型检查通过"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "实现本地存储架构与多知识库管理",
+      "description": "作为用户，我需要创建和管理多个本地知识库，所有数据100%存储在本地磁盘",
+      "acceptanceCriteria": [
+        "支持创建新知识库，选择本地存储路径",
+        "支持打开/切换多个知识库",
+        "知识库元数据存储于SQLite",
+        "笔记以标准Markdown文件存储，可直接用文件管理器打开",
+        "支持知识库列表持久化保存"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "实现Markdown编辑器核心功能",
+      "description": "作为用户，我需要编辑Markdown笔记，支持所见即所得和源码双模式",
+      "acceptanceCriteria": [
+        "集成CodeMirror 6或Monaco编辑器",
+        "支持GFM语法高亮（表格、任务列表、代码块等）",
+        "实现WYSIWYG所见即所得模式",
+        "实现Markdown源码编辑模式",
+        "支持一键切换编辑模式",
+        "自动实时保存，防内容丢失",
+        "支持撤销/重做操作"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "实现文件树与内容管理",
+      "description": "作为用户，我需要管理笔记文件，支持文件夹、标签、收藏夹等功能",
+      "acceptanceCriteria": [
+        "左侧显示多级文件夹文件树",
+        "支持文件夹/文件的拖拽排序",
+        "支持批量移动/重命名/删除操作",
+        "实现基础标签体系，支持给笔记打标签",
+        "标签聚合查看页面",
+        "实现最近访问列表",
+        "实现收藏夹功能",
+        "实现回收站，支持恢复误删文件"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "实现离线全文检索引擎",
+      "description": "作为用户，我需要快速搜索笔记内容，无网络时也可使用",
+      "acceptanceCriteria": [
+        "基于SQLite FTS5实现全文检索",
+        "支持文件名、标题、正文全内容检索",
+        "搜索结果关键词高亮显示",
+        "显示匹配上下文预览（前50字+后50字）",
+        "实现增量索引，新建/修改笔记实时更新",
+        "1000+笔记规模下检索响应时间 < 100ms"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "实现基础双向链接功能",
+      "description": "作为用户，我可以通过[[笔记标题]]语法链接其他笔记，并查看反向链接",
+      "acceptanceCriteria": [
+        "支持[[笔记标题]]双链语法解析",
+        "点击双链跳转到目标笔记",
+        "编辑器内显示双链为可点击链接",
+        "右侧面板显示当前笔记的反向链接列表",
+        "反向链接显示引用位置和上下文",
+        "链接到不存在的笔记时显示未创建提示"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "实现粘贴自动转Markdown功能",
+      "description": "作为用户，我粘贴Word/网页内容时自动转为干净的Markdown格式",
+      "acceptanceCriteria": [
+        "监听粘贴事件，获取剪贴板内容",
+        "识别HTML内容并转为Markdown",
+        "自动去除冗余格式、广告内容",
+        "保留基本格式（加粗、标题、列表等）",
+        "图片自动下载并保存为本地附件"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "实现设置面板与主题切换",
+      "description": "作为用户，我可以配置应用设置，切换浅色/深色主题",
+      "acceptanceCriteria": [
+        "设置页面包含：知识库路径、编辑器偏好、主题选择",
+        "支持浅色/深色/护眼模式切换",
+        "支持自定义字体、字号、行高",
+        "设置项持久化保存到本地",
+        "主题切换实时生效无需重启"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "实现全局快捷键与系统集成",
+      "description": "作为用户，我可以通过全局快捷键快速唤起应用或新建笔记",
+      "acceptanceCriteria": [
+        "支持全局快捷键唤起应用（默认Ctrl+Shift+Space）",
+        "支持全局快捷键快速新建笔记",
+        "支持系统托盘常驻，右键菜单操作",
+        "支持开机自启动选项",
+        "系统通知功能（备份完成等）"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "MVP整体测试与优化",
+      "description": "作为项目经理，需要确保MVP版本稳定可用，核心功能无阻塞bug",
+      "acceptanceCriteria": [
+        "所有US-001至US-009功能完整实现",
+        "核心路径（创建知识库→新建笔记→编辑→搜索→链接）无bug",
+        "1000笔记压力下性能测试通过",
+        "TypeScript类型检查无错误",
+        "ESLint检查无严重问题",
+        "打包构建成功，生成安装包",
+        "编写基础用户文档"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}
