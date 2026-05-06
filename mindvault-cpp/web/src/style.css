@@ -1,0 +1,242 @@
+/* ━━━ MindVault Global Styles ━━━ Tokyo Night Dark Premium Theme ━━━ */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  /* ─── Backgrounds ─── */
+  --bg-primary: #1a1b26;
+  --bg-secondary: #16161e;
+  --bg-tertiary: #13131a;
+  --bg-hover: #1f2335;
+  --bg-active: #292e42;
+  --bg-glass: rgba(22, 22, 30, 0.8);
+
+  /* ─── Borders ─── */
+  --border: #292e42;
+  --border-subtle: rgba(41, 46, 66, 0.5);
+  --border-focus: #7aa2f7;
+
+  /* ─── Text ─── */
+  --text-primary: #c0caf5;
+  --text-secondary: #a9b1d6;
+  --text-muted: #565f89;
+  --text-faint: #3b4261;
+
+  /* ─── Accent ─── */
+  --accent: #7aa2f7;
+  --accent-hover: #89b4fa;
+  --accent-glow: rgba(122, 162, 247, 0.12);
+  --accent-subtle: rgba(122, 162, 247, 0.06);
+
+  /* ─── Semantic ─── */
+  --purple: #bb9af7;
+  --purple-glow: rgba(187, 154, 247, 0.12);
+  --green: #9ece6a;
+  --red: #f7768e;
+  --red-glow: rgba(247, 118, 142, 0.1);
+  --orange: #ff9e64;
+  --cyan: #7dcfff;
+
+  /* ─── Radius ─── */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+
+  /* ─── Shadows ─── */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5);
+  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.6);
+  --shadow-glow: 0 0 24px rgba(122, 162, 247, 0.08);
+
+  /* ─── Transitions ─── */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --duration-fast: 0.12s;
+  --duration-normal: 0.2s;
+  --duration-slow: 0.35s;
+
+  /* ─── Font ─── */
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+}
+
+#app {
+  width: 100vw;
+  height: 100vh;
+}
+
+/* ━━━ Scrollbar ━━━ */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+  transition: background 0.2s;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3b4261;
+}
+
+/* ━━━ Selection ━━━ */
+::selection {
+  background: rgba(122, 162, 247, 0.3);
+}
+
+/* ━━━ Focus ━━━ */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ━━━ Vue Transitions ━━━ */
+
+/* 弹框淡入缩放 */
+.modal-enter-active {
+  transition: opacity var(--duration-normal) var(--ease-out),
+              transform var(--duration-normal) var(--ease-spring);
+}
+.modal-leave-active {
+  transition: opacity var(--duration-fast) ease-in,
+              transform var(--duration-fast) ease-in;
+}
+.modal-enter-from {
+  opacity: 0;
+  transform: scale(0.95) translateY(8px);
+}
+.modal-leave-to {
+  opacity: 0;
+  transform: scale(0.98) translateY(4px);
+}
+
+/* 遮罩层淡入 */
+.overlay-enter-active {
+  transition: opacity var(--duration-normal) var(--ease-out);
+}
+.overlay-leave-active {
+  transition: opacity var(--duration-fast) ease-in;
+}
+.overlay-enter-from,
+.overlay-leave-to {
+  opacity: 0;
+}
+
+/* 列表项淡入滑动 */
+.list-enter-active {
+  transition: opacity var(--duration-normal) var(--ease-out),
+              transform var(--duration-normal) var(--ease-out);
+}
+.list-leave-active {
+  transition: opacity var(--duration-fast) ease-in;
+}
+.list-enter-from {
+  opacity: 0;
+  transform: translateX(-8px);
+}
+.list-leave-to {
+  opacity: 0;
+}
+.list-move {
+  transition: transform var(--duration-normal) var(--ease-out);
+}
+
+/* 右键菜单弹出 */
+.ctx-enter-active {
+  transition: opacity var(--duration-fast) var(--ease-out),
+              transform var(--duration-fast) var(--ease-spring);
+}
+.ctx-leave-active {
+  transition: opacity 0.08s ease-in;
+}
+.ctx-enter-from {
+  opacity: 0;
+  transform: scale(0.92);
+}
+.ctx-leave-to {
+  opacity: 0;
+}
+
+/* ━━━ Light Theme ━━━ */
+[data-theme="light"] {
+  /* ─── Backgrounds ─── */
+  --bg-primary: #ffffff;
+  --bg-secondary: #f7f8fa;
+  --bg-tertiary: #eef0f4;
+  --bg-hover: #e8ebf0;
+  --bg-active: #dde1e8;
+  --bg-glass: rgba(255, 255, 255, 0.9);
+
+  /* ─── Borders ─── */
+  --border: #dde1e8;
+  --border-subtle: rgba(221, 225, 232, 0.6);
+  --border-focus: #4c8bf5;
+
+  /* ─── Text ─── */
+  --text-primary: #1a1b26;
+  --text-secondary: #3b4261;
+  --text-muted: #7a82a6;
+  --text-faint: #a9b1d6;
+
+  /* ─── Accent ─── */
+  --accent: #4c8bf5;
+  --accent-hover: #3a7ae8;
+  --accent-glow: rgba(76, 139, 245, 0.1);
+  --accent-subtle: rgba(76, 139, 245, 0.05);
+
+  /* ─── Semantic ─── */
+  --purple: #8b5cf6;
+  --purple-glow: rgba(139, 92, 246, 0.1);
+  --green: #22c55e;
+  --red: #ef4444;
+  --red-glow: rgba(239, 68, 68, 0.08);
+  --orange: #f97316;
+  --cyan: #06b6d4;
+
+  /* ─── Shadows ─── */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.12);
+  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.16);
+  --shadow-glow: 0 0 24px rgba(76, 139, 245, 0.06);
+
+  color-scheme: light;
+}
+
+[data-theme="light"] ::selection {
+  background: rgba(76, 139, 245, 0.2);
+}
+
+[data-theme="light"] ::-webkit-scrollbar-thumb {
+  background: #c4cad8;
+}
+
+[data-theme="light"] ::-webkit-scrollbar-thumb:hover {
+  background: #a9b1d6;
+}

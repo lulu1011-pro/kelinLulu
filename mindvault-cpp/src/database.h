@@ -1,0 +1,65 @@
+#pragma once
+// MindVault SQLite3 数据库封装层
+// 基于 SQLite C API，支持参数化查询、事务管理
+
+#include <sqlite3.h>
+#include <nlohmann/json.hpp>
+#include <string>
+#include <vector>
+#include <functional>
+#include <stdexcept>
+#include <memory>
+
+namespace mindvault {
+
+class Database {
+public:
+    explicit Database(const std::string& db_path);
+    ~Database();
+
+    // 禁止拷贝
+    Database(const Database&) = delete;
+    Database& operator=(const Database&) = delete;
+
+    // 初始化：建表 + FTS5 索引
+    void Init();
+
+    // 执行单条 SQL（无返回值，如 INSERT/UPDATE/DELETE）
+    void Execute(const std::string& sql);
+
+    // 参数化执行（防 SQL 注入）
+    // params 支持类型：int, int64_t, double, std::string, nullptr
+    void Execute(const std::string& sql, const std::vector<nlohmann::json>& params);
+
+    // 查询，返回 JSON 数组
+    // 每行是一个 {列名: 值} 的 JSON 对象
+    nlohmann::json Query(const std::string& sql, const std::vector<nlohmann::json>& params = {});
+
+    // 查询单行
+    nlohmann::json QueryOne(const std::string& sql, const std::vector<nlohmann::json>& params = {});
+
+    // 事务
+    void Begin();
+    void Commit();
+    void Rollback();
+
+    // 获取最后插入的 rowid
+    int64_t LastInsertId();
+
+    // 获取影响的行数
+    int Changes();
+
+    // 获取原生句柄（高级用法）
+    sqlite3* Handle() { return db_; }
+
+private:
+    sqlite3* db_ = nullptr;
+
+    // 绑定参数到 prepared statement
+    void BindParams(sqlite3_stmt* stmt, const std::vector<nlohmann::json>& params);
+
+    // 将一行结果转为 JSON
+    nlohmann::json RowToJson(sqlite3_stmt* stmt);
+};
+
+} // namespace mindvault
