@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
-import { notesApi, searchApi, tagsApi, type Note } from './api'
+import { notesApi, searchApi, tagsApi, type Note, type User } from './api'
 import Sidebar from './components/Sidebar.vue'
 import Editor from './components/Editor.vue'
 import BacklinksPanel from './components/BacklinksPanel.vue'
@@ -9,6 +9,17 @@ import SettingsModal from './components/SettingsModal.vue'
 import TabBar from './components/TabBar.vue'
 import AIChatPanel from './components/AIChatPanel.vue'
 import KnowledgeGraph from './components/KnowledgeGraph.vue'
+import FlashcardPanel from './components/FlashcardPanel.vue'
+import LoginView from './components/LoginView.vue'
+import ShareModal from './components/ShareModal.vue'
+import ShareView from './components/ShareView.vue'
+
+// ─── Route Detection ───
+const isSharePage = computed(() => window.location.pathname.startsWith('/share/'))
+
+// ─── Auth State ───
+const currentUser = ref<User | null>(null)
+const isLoggedIn = computed(() => !!currentUser.value)
 
 // ─── State ───
 const notes = ref<Note[]>([])
@@ -22,6 +33,40 @@ const filterTag = ref<string | null>(null)
 const filteredNotes = ref<Note[]>([])
 const isLoadingTagNotes = ref(false)
 
+// ─── Sidebar Resize ───
+const sidebarWidth = ref(Number(localStorage.getItem('sidebar-width')) || 260)
+const isResizing = ref(false)
+const sidebarCollapsed = ref(false)
+const sidebarOpen = ref(false)
+const MIN_SIDEBAR_WIDTH = 100
+const MAX_SIDEBAR_WIDTH = window.innerWidth - 300
+
+function toggleSidebar() {
+  sidebarCollapsed.value = !sidebarCollapsed.value
+}
+
+function startResize(e: MouseEvent) {
+  isResizing.value = true
+  const startX = e.clientX
+  const startWidth = sidebarWidth.value
+
+  function onMouseMove(e: MouseEvent) {
+    const diff = e.clientX - startX
+    const newWidth = Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, startWidth + diff))
+    sidebarWidth.value = newWidth
+  }
+
+  function onMouseUp() {
+    isResizing.value = false
+    localStorage.setItem('sidebar-width', String(sidebarWidth.value))
+    document.removeEventListener('mousemove', onMouseMove)
+    document.removeEventListener('mouseup', onMouseUp)
+  }
+
+  document.addEventListener('mousemove', onMouseMove)
+  document.addEventListener('mouseup', onMouseUp)
+}
+
 // ─── Settings ───
 const showSettings = ref(false)
 const theme = ref<'dark' | 'light'>((localStorage.getItem('mindvault-theme') as 'dark' | 'light') || 'dark')
@@ -31,6 +76,12 @@ const showAIChat = ref(false)
 
 // ─── Knowledge Graph ───
 const showGraph = ref(false)
+
+// ─── Flashcards ───
+const showFlashcards = ref(false)
+
+// ─── Share ───
+const showShare = ref(false)
 
 function applyTheme(t: 'dark' | 'light') {
   document.documentElement.setAttribute('data-theme', t)
@@ -249,7 +300,16 @@ async function doSearch(query: string) {
     return
   }
   try {
-    searchResults.value = await searchApi.search(query)
+    const results = await searchApi.search(query)
+    searchResults.value = results.map(r => ({
+      id: r.id,
+      title: r.title,
+      content: r.content_highlight || '',
+      folder: r.folder,
+      is_deleted: 0,
+      created_at: r.updated_at,
+      updated_at: r.updated_at,
+    }))
     isSearching.value = true
   } catch (e) {
     console.error('Search failed:', e)
@@ -270,8 +330,36 @@ function handleGlobalKeydown(e: KeyboardEvent) {
   }
 }
 
-onMounted(() => {
+// ─── Auth ───
+function handleLogin(user: User) {
+  currentUser.value = user
   loadNotes()
+}
+
+function logout() {
+  localStorage.removeItem('token')
+  localStorage.removeItem('user')
+  currentUser.value = null
+  notes.value = []
+  selectedNote.value = null
+}
+
+onMounted(() => {
+  // 检查登录状态
+  const savedUser = localStorage.getItem('user')
+  const token = localStorage.getItem('token')
+  if (savedUser && token) {
+    try {
+      currentUser.value = JSON.parse(savedUser)
+    } catch (e) {
+      localStorage.removeItem('user')
+      localStorage.removeItem('token')
+    }
+  }
+
+  if (isLoggedIn.value) {
+    loadNotes()
+  }
   document.addEventListener('keydown', handleGlobalKeydown)
   applyTheme(theme.value)
 })
@@ -281,26 +369,53 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="app-layout">
+  <!-- 分享页面（无需登录） -->
+  <ShareView v-if="isSharePage" />
+
+  <!-- 未登录显示登录页 -->
+  <LoginView v-else-if="!isLoggedIn" @login="handleLogin" />
+
+  <!-- 已登录显示主界面 -->
+  <div v-else class="app-layout">
+    <!-- 手机端菜单按钮 -->
+    <button class="mobile-menu-btn" @click="sidebarOpen = !sidebarOpen">
+      {{ sidebarOpen ? '✕' : '☰' }}
+    </button>
+
+    <!-- 手机端遮罩层 -->
+    <div v-if="sidebarOpen" class="mobile-overlay" @click="sidebarOpen = false"></div>
+
     <!-- Sidebar -->
-    <Sidebar
-      :notes="displayedNotes"
-      :selected-id="selectedNote?.id"
-      :search-query="searchQuery"
-      :search-results="searchResults"
-      :is-searching="isSearching"
-      :is-loading-tag="isLoadingTagNotes"
-      :active-tag="filterTag"
-      @select="selectNote"
-      @create="createNote"
-      @delete="deleteNote"
-      @rename="renameNote"
-      @move="moveNote"
-      @search="searchQuery = $event"
-      @create-folder="createFolder"
-      @refresh="loadNotes"
-      @filter-tag="filterByTag"
-    />
+    <div class="sidebar-wrapper" :class="{ open: sidebarOpen }">
+      <div class="sidebar-container" :class="{ collapsed: sidebarCollapsed }" :style="{ width: sidebarCollapsed ? '0px' : sidebarWidth + 'px' }">
+        <div class="sidebar-content" :style="{ width: sidebarWidth + 'px' }">
+          <Sidebar
+            :notes="displayedNotes"
+            :selected-id="selectedNote?.id"
+            :search-query="searchQuery"
+            :search-results="searchResults"
+            :is-searching="isSearching"
+            :is-loading-tag="isLoadingTagNotes"
+            :active-tag="filterTag"
+            @select="selectNote"
+            @create="createNote"
+            @delete="deleteNote"
+            @rename="renameNote"
+            @move="moveNote"
+            @search="searchQuery = $event"
+            @create-folder="createFolder"
+            @refresh="loadNotes"
+            @filter-tag="filterByTag"
+          />
+        </div>
+        <!-- 拖拽手柄在右侧 -->
+        <div v-show="!sidebarCollapsed" class="resize-handle" @mousedown="startResize"></div>
+      </div>
+      <!-- 折叠/展开按钮始终可见 -->
+      <div class="sidebar-collapse-btn" @click="toggleSidebar" :title="sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'">
+        {{ sidebarCollapsed ? '▶' : '◀' }}
+      </div>
+    </div>
 
     <!-- Main Area -->
     <div v-if="selectedNote" class="main-area">
@@ -316,6 +431,7 @@ onBeforeUnmount(() => {
           @save="saveNote"
           @navigate="navigateToNote"
           @open-settings="showSettings = true"
+          @open-share="showShare = true"
         />
         <!-- 反向链接面板 -->
         <BacklinksPanel
@@ -375,11 +491,46 @@ onBeforeUnmount(() => {
       @select-note="selectNote"
     />
 
+    <!-- 闪卡面板 -->
+    <FlashcardPanel
+      v-if="selectedNote"
+      :note-id="selectedNote.id"
+      :note-title="selectedNote.title"
+      :visible="showFlashcards"
+      @close="showFlashcards = false"
+    />
+
+    <!-- 分享弹框 -->
+    <ShareModal
+      v-if="selectedNote"
+      :visible="showShare"
+      :note-id="selectedNote.id"
+      :note-title="selectedNote.title"
+      @close="showShare = false"
+    />
+
     <!-- 悬浮按钮 -->
     <div class="fab-container">
+      <button class="fab-btn fab-flash" @click="showFlashcards = true" title="闪卡学习">🃏</button>
       <button class="fab-btn fab-graph" @click="showGraph = true" title="知识图谱">🕸️</button>
       <button class="fab-btn fab-ai" @click="showAIChat = true" title="AI 助手">🤖</button>
     </div>
+
+    <!-- 用户信息 -->
+    <div class="user-info" v-if="currentUser">
+      <span class="user-name">{{ currentUser.nickname || currentUser.username }}</span>
+      <button class="btn-logout" @click="logout" title="退出登录">退出</button>
+    </div>
+
+    <!-- 反向链接切换按钮 -->
+    <button
+      class="toggle-backlinks"
+      :class="{ collapsed: !showBacklinks }"
+      @click="showBacklinks = !showBacklinks"
+      :title="showBacklinks ? '收起链接面板' : '展开链接面板'"
+    >
+      {{ showBacklinks ? '›' : '‹' }}
+    </button>
   </div>
 </template>
 
@@ -389,6 +540,66 @@ onBeforeUnmount(() => {
   height: 100vh;
   background: var(--bg-primary);
   color: var(--text-primary);
+}
+
+.sidebar-wrapper {
+  display: flex;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.sidebar-container {
+  display: flex;
+  flex-shrink: 0;
+  position: relative;
+  transition: width 0.1s ease;
+  overflow: hidden;
+}
+
+.sidebar-content {
+  flex: 1;
+  height: 100%;
+  overflow: auto;
+  position: relative;
+}
+
+.sidebar-collapse-btn {
+  flex-shrink: 0;
+  width: 20px;
+  height: 100%;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 20;
+  font-size: 10px;
+  color: var(--text-muted);
+  transition: all 0.2s ease;
+}
+
+.sidebar-collapse-btn:hover {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.resize-handle {
+  position: absolute;
+  top: 0;
+  right: -2px;
+  width: 4px;
+  height: 100%;
+  cursor: col-resize;
+  background: transparent;
+  transition: background 0.2s;
+  z-index: 10;
+}
+
+.resize-handle:hover {
+  background: var(--accent);
 }
 
 .main-area {
@@ -589,5 +800,152 @@ onBeforeUnmount(() => {
   transform: scale(1.1);
   box-shadow: var(--shadow-lg);
   border-color: var(--accent);
+}
+
+/* ─── 用户信息 ─── */
+.user-info {
+  position: fixed;
+  bottom: 12px;
+  left: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  z-index: 50;
+  background: var(--bg-secondary);
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+
+.user-name {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.btn-logout {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all var(--duration-fast);
+}
+
+.btn-logout:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/* ─── 手机端适配 ─── */
+@media (max-width: 768px) {
+  .app-layout {
+    flex-direction: column;
+  }
+
+  .sidebar-wrapper {
+    position: fixed;
+    top: 0;
+    left: 0;
+    height: 100vh;
+    z-index: 100;
+    width: 85vw;
+    max-width: 320px;
+    transform: translateX(-100%);
+    transition: transform 0.3s ease;
+  }
+
+  .sidebar-wrapper.open {
+    transform: translateX(0);
+  }
+
+  .sidebar-container {
+    width: 100% !important;
+    height: 100%;
+  }
+
+  .sidebar-content {
+    width: 100% !important;
+  }
+
+  .sidebar-collapse-btn {
+    position: fixed;
+    top: 12px;
+    left: 12px;
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
+    z-index: 101;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-md);
+  }
+
+  .main-area {
+    width: 100%;
+    height: 100vh;
+  }
+
+  .main-content {
+    flex-direction: column;
+  }
+
+  .toggle-backlinks {
+    display: none;
+  }
+
+  .fab-container {
+    bottom: 16px;
+    right: 16px;
+  }
+
+  .fab-btn {
+    width: 44px;
+    height: 44px;
+    font-size: 20px;
+  }
+}
+
+/* ─── 手机端菜单按钮 ─── */
+.mobile-menu-btn {
+  display: none;
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  font-size: 20px;
+  cursor: pointer;
+  z-index: 102;
+  box-shadow: var(--shadow-md);
+  align-items: center;
+  justify-content: center;
+}
+
+.mobile-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 99;
+}
+
+@media (max-width: 768px) {
+  .mobile-menu-btn {
+    display: flex;
+  }
+
+  .mobile-overlay {
+    display: block;
+  }
+
+  .sidebar-collapse-btn {
+    display: none;
+  }
 }
 </style>

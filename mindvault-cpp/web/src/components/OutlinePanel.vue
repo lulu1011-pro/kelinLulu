@@ -119,6 +119,10 @@ function handleClick(slug: string) {
   flex-direction: column;
   overflow: hidden;
   height: 100%;
+  min-width: 150px;
+  max-width: 300px;
+  border-left: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 .outline-header {

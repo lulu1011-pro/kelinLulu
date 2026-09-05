@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ref } from 'vue'
 import { type Note } from '../api'
 
 export interface FolderNode {
@@ -22,6 +23,9 @@ const emit = defineEmits<{
   toggleFolder: [path: string]
   folderContext: [e: MouseEvent, path: string]
   noteContext: [e: MouseEvent, note: Note]
+  noteDrop: [e: DragEvent, note: Note]
+  noteDragStart: [e: DragEvent, note: Note]
+  folderDrop: [e: DragEvent, folderPath: string]
 }>()
 
 function formatDate(dateStr: string) {
@@ -35,6 +39,31 @@ function formatDate(dateStr: string) {
   const hours = Math.floor(mins / 60)
   if (hours < 24) return `${hours}小时前`
   return d.toLocaleDateString()
+}
+
+// ─── 拖拽相关 ───
+const dragOverId = ref<number | null>(null)
+const isDragOverFolder = ref(false)
+
+function onNoteDragOver(_e: DragEvent, note: Note) {
+  dragOverId.value = note.id
+}
+
+function onNoteDragLeave() {
+  dragOverId.value = null
+}
+
+function onFolderDragOver() {
+  isDragOverFolder.value = true
+}
+
+function onFolderDragLeave() {
+  isDragOverFolder.value = false
+}
+
+function onFolderDrop(e: DragEvent) {
+  isDragOverFolder.value = false
+  emit('folderDrop', e, props.folder.path)
 }
 
 function getFolderIcon(path: string): string {
@@ -53,9 +82,12 @@ function getFolderIcon(path: string): string {
   <div :style="{ paddingLeft: (depth + 1) * 12 + 'px' }">
     <div
       class="folder-item"
-      :class="{ active: activeFolder === folder.path }"
+      :class="{ active: activeFolder === folder.path, 'drag-over': isDragOverFolder }"
       @click="emit('toggleFolder', folder.path)"
       @contextmenu.prevent="emit('folderContext', $event, folder.path)"
+      @dragover.prevent="onFolderDragOver"
+      @dragleave="onFolderDragLeave"
+      @drop.prevent="onFolderDrop($event)"
     >
       <span class="folder-toggle" @click.stop="emit('toggleFolder', folder.path)">
         {{ collapsed.has(folder.path) ? '▶' : '▼' }}
@@ -78,15 +110,23 @@ function getFolderIcon(path: string): string {
         @toggle-folder="(p) => emit('toggleFolder', p)"
         @folder-context="(e, p) => emit('folderContext', e, p)"
         @note-context="(e, n) => emit('noteContext', e, n)"
+        @note-drop="(e, n) => emit('noteDrop', e, n)"
+        @note-drag-start="(e, n) => emit('noteDragStart', e, n)"
+        @folder-drop="(e, p) => emit('folderDrop', e, p)"
       />
       <!-- 笔记列表 -->
       <div
         v-for="note in folder.notes"
         :key="note.id"
         class="note-item"
-        :class="{ active: note.id === selectedId }"
+        :class="{ active: note.id === selectedId, 'drag-over': dragOverId === note.id }"
+        draggable="true"
         @click="emit('selectNote', note)"
         @contextmenu.prevent="emit('noteContext', $event, note)"
+        @dragstart="emit('noteDragStart', $event, note)"
+        @dragover.prevent="onNoteDragOver($event, note)"
+        @dragleave="onNoteDragLeave"
+        @drop.prevent="emit('noteDrop', $event, note)"
       >
         <span class="note-icon">📄</span>
         <div class="note-info">
@@ -116,6 +156,11 @@ function getFolderIcon(path: string): string {
 
 .folder-item.active {
   background: var(--accent-glow, rgba(122, 162, 247, 0.12));
+}
+
+.folder-item.drag-over {
+  background: var(--accent-glow, rgba(122, 162, 247, 0.2));
+  border: 1px dashed var(--accent, #7aa2f7);
 }
 
 .folder-toggle {

@@ -240,3 +240,82 @@ body {
 [data-theme="light"] ::-webkit-scrollbar-thumb:hover {
   background: #a9b1d6;
 }
+
+/* ━━━ 响应式布局 ━━━ */
+
+/* 平板 */
+@media (max-width: 1024px) {
+  :root {
+    --sidebar-width: 240px;
+  }
+}
+
+/* 手机 */
+@media (max-width: 768px) {
+  :root {
+    --sidebar-width: 100vw;
+  }
+
+  /* 侧边栏全屏 */
+  .sidebar-container {
+    position: fixed;
+    top: 0;
+    left: 0;
+    height: 100vh;
+    z-index: 100;
+    width: 100vw !important;
+    transition: transform 0.3s ease;
+  }
+
+  .sidebar-container.collapsed {
+    transform: translateX(-100%);
+    width: 100vw !important;
+  }
+
+  /* 主内容区 */
+  .main-area {
+    width: 100vw;
+  }
+
+  /* 编辑器工具栏 */
+  .md-toolbar {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+  }
+
+  /* 搜索弹框 */
+  .search-modal {
+    width: 95vw;
+    max-width: 95vw;
+  }
+
+  /* 弹框 */
+  .modal-box {
+    width: 90vw;
+    max-width: 90vw;
+  }
+
+  /* 浮动按钮 */
+  .fab-container {
+    bottom: 16px;
+    right: 16px;
+  }
+
+  .fab-btn {
+    width: 40px;
+    height: 40px;
+    font-size: 20px;
+  }
+}
+
+/* 小屏手机 */
+@media (max-width: 480px) {
+  .toolbar-right {
+    gap: 2px;
+  }
+
+  .btn-toolbar {
+    padding: 4px 6px;
+    font-size: 11px;
+  }
+}

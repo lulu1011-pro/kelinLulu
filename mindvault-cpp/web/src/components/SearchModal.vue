@@ -27,7 +27,8 @@ watch(query, (q) => {
   searchTimer = setTimeout(async () => {
     loading.value = true
     try {
-      results.value = await searchApi.search(q)
+      const searchResults = await searchApi.search(q)
+      results.value = searchResults.map(r => ({ ...r, _type: 'search' as const }))
       selectedIndex.value = 0
     } catch (e) {
       console.error('Search failed:', e)

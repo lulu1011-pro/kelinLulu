@@ -1,30 +1,93 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue'
+import { ref, watch, onMounted, onBeforeUnmount, shallowRef, nextTick, computed } from 'vue'
 import { EditorState } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { oneDark } from '@codemirror/theme-one-dark'
 import { searchKeymap } from '@codemirror/search'
-import { type Note, notesApi, tagsApi, filesApi } from '../api'
+import { type Note, tagsApi, filesApi, collabApi } from '../api'
 import { marked } from 'marked'
 import TurndownService from 'turndown'
 import mammoth from 'mammoth'
+import { Document, Packer, Paragraph, TextRun, HeadingLevel, BorderStyle } from 'docx'
 import OutlinePanel from './OutlinePanel.vue'
 import VersionHistory from './VersionHistory.vue'
+import DrawingBoard from './DrawingBoard.vue'
 
 const props = defineProps<{ note: Note }>()
 const emit = defineEmits<{
   save: [id: number, title: string, content: string]
   navigate: [title: string]
   openSettings: []
+  openShare: []
 }>()
 
 const editMode = ref<'edit' | 'preview' | 'split'>('split')
 const showOutline = ref(true)
 const showVersionHistory = ref(false)
+const showDrawingBoard = ref(false)
 const noteTitle = ref(props.note.title)
 const noteContent = ref(props.note.content || '')
+const viewerCount = ref(0)
+const viewerNames = ref<string[]>([])
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+let viewerTimer: ReturnType<typeof setInterval> | null = null
+const viewerTooltip = computed(() => {
+  if (viewerNames.value.length > 0) {
+    return `协作者：${viewerNames.value.join('、')}`
+  }
+  return `协作者：${viewerCount.value} 人在线`
+})
+
+// 协作功能
+function stopCollabTracking(noteId?: number) {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer)
+    heartbeatTimer = null
+  }
+  if (viewerTimer) {
+    clearInterval(viewerTimer)
+    viewerTimer = null
+  }
+  viewerCount.value = 0
+  viewerNames.value = []
+  if (noteId) {
+    collabApi.leave(noteId).catch(() => {})
+  }
+}
+
+watch(() => props.note.id, (nid, oldNid, onCleanup) => {
+  if (oldNid && oldNid !== nid) {
+    stopCollabTracking(oldNid)
+  }
+  if (!nid) {
+    stopCollabTracking()
+    return
+  }
+
+  const refreshViewers = () => {
+    collabApi.viewers(nid).then(v => {
+      viewerCount.value = v.length
+      viewerNames.value = v
+        .map(user => user.username?.trim())
+        .filter((name): name is string => Boolean(name))
+    }).catch(() => {})
+  }
+
+  collabApi.join(nid).catch(() => {})
+  collabApi.heartbeat(nid).catch(() => {})
+  refreshViewers()
+
+  heartbeatTimer = setInterval(() => {
+    collabApi.heartbeat(nid).catch(() => {})
+  }, 15000)
+  viewerTimer = setInterval(refreshViewers, 10000)
+
+  onCleanup(() => {
+    stopCollabTracking(nid)
+  })
+}, { immediate: true })
 const previewHtml = ref('')
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 const editorContainer = ref<HTMLDivElement>()
@@ -96,7 +159,6 @@ turndown.addRule('strikethrough', {
 })
 
 // ─── Marked: 用 try-catch 保护初始化 ───
-let markedReady = false
 try {
   const wikiLinkExt = {
     name: 'wikiLink',
@@ -112,10 +174,8 @@ try {
     },
   }
   marked.use({ extensions: [wikiLinkExt] })
-  markedReady = true
 } catch (e) {
   console.warn('marked wiki extension failed:', e)
-  markedReady = false
 }
 
 function renderMarkdown(content: string): string {
@@ -166,7 +226,7 @@ function wrapSelection(before: string, after: string, placeholder = '') {
 function prependLine(prefix: string) {
   const view = editorView.value
   if (!view) return
-  const { from, to } = view.state.selection.main
+  const { from } = view.state.selection.main
   const line = view.state.doc.lineAt(from)
   const currentPrefix = view.state.sliceDoc(line.from, line.from + prefix.length)
   const changes = currentPrefix === prefix
@@ -201,7 +261,7 @@ const toolbarActions = {
   ol: () => prependLine('1. '),
   task: () => prependLine('- [ ] '),
   quote: () => prependLine('> '),
-  link: () => wrapSelection('[', '](url)', '链接文字'),
+  link: () => wrapSelection('[[', ']]', '笔记标题'),
   image: () => wrapSelection('![', '](url)', '图片描述'),
   codeBlock: () => insertBlock('\n```\n代码\n```\n'),
   table: () => insertBlock('\n| 列1 | 列2 | 列3 |\n| --- | --- | --- |\n| 内容 | 内容 | 内容 |\n'),
@@ -262,33 +322,56 @@ function setContent(md: string) {
 
 // ─── 从剪贴板粘贴 HTML（自动转 Markdown） ───
 async function handlePaste(e: ClipboardEvent) {
-  // 检查是否有图片
   const items = e.clipboardData?.items
+  const view = editorView.value
+  if (!view) return
+
+  // 收集所有图片
+  const imageFiles: File[] = []
   if (items) {
     for (const item of items) {
       if (item.type.startsWith('image/')) {
-        e.preventDefault()
         const file = item.getAsFile()
-        if (file) {
-          await uploadAndInsertImage(file)
-        }
-        return
+        if (file) imageFiles.push(file)
       }
     }
   }
 
-  // 检查 HTML 内容
-  const html = e.clipboardData?.getData('text/html')
-  if (html && html.trim()) {
+  // 获取文本内容
+  const text = e.clipboardData?.getData('text/plain') || ''
+  const html = e.clipboardData?.getData('text/html') || ''
+
+  // 如果有图片或HTML内容，阻止默认行为
+  if (imageFiles.length > 0 || (html && html.trim() && !html.includes('mso-') && html.length > text.length * 2)) {
     e.preventDefault()
-    const md = turndown.turndown(html)
-    const view = editorView.value
-    if (view) {
+
+    // 插入图片
+    for (const file of imageFiles) {
+      try {
+        const { url } = await filesApi.uploadImage(file)
+        const md = `![${file.name}](${url})`
+        const { from, to } = view.state.selection.main
+        view.dispatch({ changes: { from, to, insert: md } })
+      } catch (err) {
+        console.error('Image upload failed:', err)
+      }
+    }
+
+    // 插入文本（HTML转Markdown或纯文本）
+    if (html && html.trim() && !html.includes('mso-') && html.length > text.length * 2) {
+      const md = turndown.turndown(html)
       const { from, to } = view.state.selection.main
       view.dispatch({ changes: { from, to, insert: md } })
-      view.focus()
+    } else if (text) {
+      const { from, to } = view.state.selection.main
+      view.dispatch({ changes: { from, to, insert: text } })
     }
+
+    view.focus()
+    return
   }
+
+  // 纯文本情况：让 CodeMirror 默认处理
 }
 
 // ─── 上传图片并插入 Markdown ───
@@ -374,6 +457,86 @@ function exportPdf() {
   }, 300)
 }
 
+// ─── Word 导出 ───
+async function exportWord() {
+  const tokens = marked.lexer(noteContent.value)
+  const children: any[] = []
+
+  // 添加标题
+  children.push(new Paragraph({
+    heading: HeadingLevel.HEADING_1,
+    children: [new TextRun(noteTitle.value || '无标题')],
+  }))
+
+  for (const token of tokens) {
+    if (token.type === 'heading') {
+      const headingLevel = token.depth === 1 ? HeadingLevel.HEADING_1 :
+                          token.depth === 2 ? HeadingLevel.HEADING_2 :
+                          token.depth === 3 ? HeadingLevel.HEADING_3 :
+                          HeadingLevel.HEADING_4
+      children.push(new Paragraph({
+        heading: headingLevel,
+        children: [new TextRun(token.text)],
+      }))
+    } else if (token.type === 'paragraph') {
+      children.push(new Paragraph({
+        children: [new TextRun(token.text)],
+      }))
+    } else if (token.type === 'list') {
+      for (const item of token.items) {
+        children.push(new Paragraph({
+          bullet: { level: 0 },
+          children: [new TextRun(item.text)],
+        }))
+      }
+    } else if (token.type === 'code') {
+      children.push(new Paragraph({
+        children: [new TextRun({ text: token.text, font: 'Consolas' })],
+      }))
+    } else if (token.type === 'blockquote') {
+      children.push(new Paragraph({
+        indent: { left: 720 },
+        children: [new TextRun({ text: token.text, italics: true })],
+      }))
+    } else if (token.type === 'hr') {
+      children.push(new Paragraph({
+        border: { bottom: { style: BorderStyle.SINGLE, size: 1 } },
+        children: [],
+      }))
+    }
+  }
+
+  const doc = new Document({ sections: [{ children }] })
+  const blob = await Packer.toBlob(doc)
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${noteTitle.value || '笔记'}.docx`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+// ─── HTML 导出 ───
+function exportHtml() {
+  const url = `/api/files/export-html/${props.note.id}`
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${noteTitle.value || '笔记'}.html`
+  a.click()
+}
+
+// ─── Markdown 导出 ───
+function exportMarkdown() {
+  const content = `# ${noteTitle.value}\n\n${noteContent.value}`
+  const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${noteTitle.value || '笔记'}.md`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 // ─── 大纲：滚动同步 ───
 const activeOutlineSlug = ref('')
 let scrollSyncTimer: ReturnType<typeof setTimeout> | null = null
@@ -385,7 +548,6 @@ function handlePreviewScroll() {
     const headings = previewRef.value.querySelectorAll('h1, h2, h3, h4, h5, h6')
     if (headings.length === 0) return
 
-    const scrollTop = previewRef.value.scrollTop
     const containerTop = previewRef.value.getBoundingClientRect().top
 
     // 找到当前可见的标题（最后一个在视口上方的标题）
@@ -434,6 +596,19 @@ function handleVersionRestore(content: string) {
   setContent(content)
 }
 
+// ─── 画板保存 ───
+function handleDrawingSave(imageData: string) {
+  // 插入图片到笔记
+  const md = `![drawing](${imageData})`
+  const view = editorView.value
+  if (view) {
+    const { from, to } = view.state.selection.main
+    view.dispatch({ changes: { from, to, insert: md } })
+    view.focus()
+  }
+  showDrawingBoard.value = false
+}
+
 // ─── Editor 创建 ───
 function createEditor() {
   if (!editorContainer.value) return
@@ -470,11 +645,6 @@ function createEditor() {
           '.cm-scroller': { overflow: 'auto' },
           '.cm-content': { fontFamily: '"JetBrains Mono", Consolas, monospace' },
         }),
-        // 拦截粘贴和拖拽事件
-        EditorView.domEventHandlers({
-          paste: handlePaste,
-          drop: handleDrop,
-        }),
       ],
     })
 
@@ -486,6 +656,10 @@ function createEditor() {
     // 编辑器滚动同步大纲
     const cmScroller = editorView.value.scrollDOM
     cmScroller.addEventListener('scroll', handleEditorScroll)
+
+    // 添加粘贴和拖拽事件监听器
+    cmScroller.addEventListener('paste', handlePaste)
+    cmScroller.addEventListener('drop', handleDrop)
   } catch (e) {
     console.error('CodeMirror init failed:', e)
   }
@@ -498,7 +672,6 @@ function handleEditorScroll() {
     const scroller = editorView.value.scrollDOM
     const scrollTop = scroller.scrollTop
     const lines = editorView.value.state.doc
-    const lineHeight = editorView.value.defaultLineHeight
 
     // 找到当前可见区域对应的行
     let currentSlug = ''
@@ -561,11 +734,6 @@ function handlePreviewClick(e: MouseEvent) {
   }
 }
 
-async function navigateToWikiLink(title: string) {
-  // 通过 emit 让 App.vue 负责切换笔记（而不是内部偷偷改）
-  emit('navigate', title)
-}
-
 watch(() => props.note.id, () => {
   noteTitle.value = props.note.title
   noteContent.value = props.note.content || ''
@@ -592,6 +760,7 @@ onBeforeUnmount(() => {
   if (saveTimer) clearTimeout(saveTimer)
   if (renderTimer) clearTimeout(renderTimer)
   if (scrollSyncTimer) clearTimeout(scrollSyncTimer)
+  stopCollabTracking(props.note.id)
 })
 </script>
 
@@ -601,8 +770,16 @@ onBeforeUnmount(() => {
     <div class="editor-toolbar">
       <input v-model="noteTitle" class="note-title-input" placeholder="Note title..." />
       <div class="toolbar-right">
-        <button class="btn-toolbar" @click="exportPdf" title="导出 PDF">📄</button>
-        <button class="btn-toolbar" @click="importInput?.click()" title="导入文件 (HTML/TXT/MD)">📥</button>
+        <div class="export-dropdown">
+          <button class="btn-toolbar" title="导出">📤</button>
+          <div class="export-menu">
+            <button @click="exportPdf" title="导出 PDF">📄 PDF</button>
+            <button @click="exportWord" title="导出 Word">📝 Word</button>
+            <button @click="exportHtml" title="导出 HTML">🌐 HTML</button>
+            <button @click="exportMarkdown" title="导出 Markdown">📋 Markdown</button>
+          </div>
+        </div>
+        <button class="btn-toolbar" @click="importInput?.click()" title="导入文件 (HTML/TXT/MD/DOCX)">📥</button>
         <button
           class="btn-toolbar"
           :class="{ active: showOutline }"
@@ -610,7 +787,14 @@ onBeforeUnmount(() => {
           title="大纲导航"
         >📑</button>
         <button class="btn-toolbar" @click="emit('openSettings')" title="设置">⚙️</button>
+        <button class="btn-toolbar" @click="emit('openShare')" title="分享笔记">🔗</button>
         <button class="btn-toolbar" @click="showVersionHistory = true" title="版本历史">📋</button>
+        <button class="btn-toolbar" @click="showDrawingBoard = true" title="画板">🎨</button>
+        <span v-if="viewerCount > 0" class="viewer-indicator" :title="viewerTooltip">
+          <span class="viewer-indicator__icon">👥</span>
+          <span class="viewer-indicator__label">多人编辑</span>
+          <span class="viewer-indicator__count">{{ viewerCount }} 人</span>
+        </span>
         <input ref="importInput" type="file" accept=".md,.txt,.html,.htm,.docx" style="display:none" @change="handleImportFile" />
         <div class="mode-switch">
           <button :class="{ active: editMode === 'edit' }" @click="editMode = 'edit'" title="编辑模式">✏️</button>
@@ -699,6 +883,13 @@ onBeforeUnmount(() => {
       @close="showVersionHistory = false"
       @restore="handleVersionRestore"
     />
+
+    <!-- 画板弹框 -->
+    <DrawingBoard
+      :visible="showDrawingBoard"
+      @close="showDrawingBoard = false"
+      @save="handleDrawingSave"
+    />
   </div>
 </template>
 
@@ -753,6 +944,27 @@ onBeforeUnmount(() => {
   color: var(--accent);
 }
 
+.viewer-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--green);
+  padding: 2px 8px;
+  background: rgba(34, 197, 94, 0.1);
+  border-radius: 10px;
+  white-space: nowrap;
+  border: 1px solid rgba(34, 197, 94, 0.2);
+}
+
+.viewer-indicator__label {
+  font-weight: 600;
+}
+
+.viewer-indicator__count {
+  color: var(--text-secondary);
+}
+
 .note-title-input {
   flex: 1;
   background: transparent;
@@ -797,6 +1009,47 @@ onBeforeUnmount(() => {
   background: var(--bg-active);
   color: var(--text-primary);
   box-shadow: var(--shadow-sm);
+}
+
+/* ─── 导出下拉菜单 ─── */
+.export-dropdown {
+  position: relative;
+}
+
+.export-menu {
+  display: none;
+  position: absolute;
+  top: 100%;
+  right: 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  z-index: 100;
+  min-width: 140px;
+  padding: 4px;
+}
+
+.export-dropdown:hover .export-menu {
+  display: block;
+}
+
+.export-menu button {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.export-menu button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
 }
 
 /* ─── Markdown 工具栏 ─── */

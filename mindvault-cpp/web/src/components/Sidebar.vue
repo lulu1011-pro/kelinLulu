@@ -183,6 +183,10 @@ function confirmDelete() {
 function doDelete() {
   emit('delete', deleteConfirm.value.noteId)
   deleteConfirm.value.visible = false
+  // 删除后自动刷新回收站
+  if (trashExpanded.value) {
+    setTimeout(() => loadTrash(), 300)
+  }
 }
 
 // ─── 重命名 ───
@@ -337,7 +341,40 @@ function doCreateRootFolder() {
 
 function copyTitle(note: Note) {
   hideContextMenu()
-  navigator.clipboard.writeText(note.title).catch(() => {})
+  // 复制为 Wiki 链接格式 [[标题]]
+  const wikiLink = `[[${note.title}]]`
+
+  // 使用 navigator.clipboard API（如果可用）
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(wikiLink).then(() => {
+      console.log('Copied:', wikiLink)
+    }).catch(() => {
+      // 降级方案
+      fallbackCopy(wikiLink)
+    })
+  } else {
+    // 降级方案
+    fallbackCopy(wikiLink)
+  }
+}
+
+function fallbackCopy(text: string) {
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.style.position = 'fixed'
+    textarea.style.left = '-9999px'
+    textarea.style.top = '-9999px'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.focus()
+    textarea.select()
+    const result = document.execCommand('copy')
+    document.body.removeChild(textarea)
+    console.log('Copied (fallback):', text, 'Result:', result)
+  } catch (e) {
+    console.error('Copy failed:', e)
+  }
 }
 
 function formatDate(dateStr: string) {
@@ -417,13 +454,41 @@ function onDragStart(e: DragEvent, note: Note) {
   e.dataTransfer.setData('text/plain', note.id.toString())
 }
 
-function onDragOver(e: DragEvent, note: Note) {
+function onDragOver(_e: DragEvent, note: Note) {
   if (dragTargetId.value === note.id) return
   dragOverId.value = note.id
 }
 
 function onDragLeave() {
   dragOverId.value = null
+}
+
+// 拖拽到文件夹
+async function onFolderDrop(e: DragEvent, folderPath: string) {
+  e.preventDefault()
+  if (!dragTargetId.value) return
+
+  const sourceId = dragTargetId.value
+  dragTargetId.value = null
+
+  // 获取源笔记
+  const sourceNote = props.notes.find(n => n.id === sourceId)
+  if (!sourceNote) return
+
+  // 如果目标文件夹和源文件夹不同，改变文件夹
+  const sourceFolder = sourceNote.folder || 'default'
+  if (sourceFolder !== folderPath) {
+    try {
+      await notesApi.update(sourceId, {
+        title: sourceNote.title,
+        content: sourceNote.content || '',
+        folder: folderPath
+      })
+      emit('refresh')
+    } catch (err) {
+      console.error('Failed to move note:', err)
+    }
+  }
 }
 
 async function onDrop(e: DragEvent, targetNote: Note) {
@@ -438,9 +503,30 @@ async function onDrop(e: DragEvent, targetNote: Note) {
   const sourceId = dragTargetId.value
   dragTargetId.value = null
 
-  // 获取当前文件夹的笔记列表，重新排序
-  const folder = targetNote.folder || 'default'
-  const notesInFolder = props.notes.filter(n => (n.folder || 'default') === folder)
+  // 获取源笔记
+  const sourceNote = props.notes.find(n => n.id === sourceId)
+  if (!sourceNote) return
+
+  const targetFolder = targetNote.folder || 'default'
+  const sourceFolder = sourceNote.folder || 'default'
+
+  // 如果源笔记和目标笔记不在同一个文件夹，改变源笔记的文件夹
+  if (sourceFolder !== targetFolder) {
+    try {
+      await notesApi.update(sourceId, {
+        title: sourceNote.title,
+        content: sourceNote.content || '',
+        folder: targetFolder
+      })
+      emit('refresh')
+    } catch (err) {
+      console.error('Failed to move note:', err)
+    }
+    return
+  }
+
+  // 同一个文件夹内排序
+  const notesInFolder = props.notes.filter(n => (n.folder || 'default') === targetFolder)
   const sourceIdx = notesInFolder.findIndex(n => n.id === sourceId)
   const targetIdx = notesInFolder.findIndex(n => n.id === targetNote.id)
 
@@ -654,6 +740,9 @@ async function doEmptyTrash() {
               @toggle-folder="toggleFolder"
               @folder-context="onFolderContextFromTree"
               @note-context="onNoteContextFromTree"
+              @note-drop="onDrop"
+              @note-drag-start="onDragStart"
+              @folder-drop="onFolderDrop"
             />
             <!-- 当前文件夹的笔记 -->
             <div
@@ -723,7 +812,7 @@ async function doEmptyTrash() {
           </button>
           <div class="tags-cloud">
             <button
-              v-for="tag in allTags"
+              v-for="tag in allTags.filter(t => t.note_count && t.note_count > 0)"
               :key="tag.id"
               class="tag-item"
               :class="{ active: props.activeTag === tag.name }"
@@ -953,8 +1042,8 @@ async function doEmptyTrash() {
 
 <style scoped>
 .sidebar {
-  width: 280px;
-  min-width: 280px;
+  width: 100%;
+  min-width: 0;
   background: var(--bg-secondary);
   border-right: 1px solid var(--border);
   display: flex;

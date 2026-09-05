@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { ref, watch, onBeforeUnmount, nextTick } from 'vue'
 import * as d3 from 'd3'
 import { notesApi, type Note } from '../api'
 
@@ -147,7 +147,7 @@ function renderGraph() {
         d.fx = null
         d.fy = null
       }) as any)
-    .on('click', (event, d) => {
+    .on('click', (_event, d) => {
       const note = { id: d.id, title: d.title, folder: d.folder } as Note
       emit('selectNote', note)
     })
@@ -161,8 +161,17 @@ function renderGraph() {
         '学习': '#9ece6a',
         '工作': '#ff9e64',
         '生活': '#bb9af7',
+        '项目': '#ff9e64',
+        '日记': '#bb9af7',
+        '想法': '#e0af68',
+        '收藏': '#f7768e',
       }
-      return colors[d.folder] || '#7aa2f7'
+      // 根据文件夹名生成颜色
+      if (colors[d.folder]) return colors[d.folder]
+      // 为其他文件夹生成随机颜色
+      const hash = d.folder.split('').reduce((a, b) => { a = ((a << 5) - a) + b.charCodeAt(0); return a & a }, 0)
+      const hue = Math.abs(hash) % 360
+      return `hsl(${hue}, 70%, 60%)`
     })
     .attr('stroke', '#1a1b26')
     .attr('stroke-width', 2)
@@ -192,7 +201,9 @@ function renderGraph() {
 }
 
 onBeforeUnmount(() => {
-  d3.select(graphRef.value).selectAll('*').remove()
+  if (graphRef.value) {
+    d3.select(graphRef.value).selectAll('*').remove()
+  }
 })
 </script>
 
@@ -232,6 +243,15 @@ onBeforeUnmount(() => {
                 </span>
                 <span class="legend-item">
                   <span class="legend-dot" style="background: #bb9af7"></span> 生活
+                </span>
+                <span class="legend-item">
+                  <span class="legend-dot" style="background: #e0af68"></span> 想法
+                </span>
+                <span class="legend-item">
+                  <span class="legend-dot" style="background: #f7768e"></span> 收藏
+                </span>
+                <span class="legend-item">
+                  <span class="legend-dot" style="background: #73daca"></span> 其他
                 </span>
               </div>
               <span class="graph-count">{{ nodes.length }} 个笔记 · {{ links.length }} 条链接</span>

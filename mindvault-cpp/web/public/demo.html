@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MindVault 演示</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #1a1b26;
+      color: #c0caf5;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px;
+    }
+    .container {
+      max-width: 800px;
+      width: 100%;
+    }
+    h1 {
+      font-size: 48px;
+      color: #7aa2f7;
+      margin-bottom: 8px;
+      text-align: center;
+    }
+    .subtitle {
+      text-align: center;
+      color: #565f89;
+      font-size: 18px;
+      margin-bottom: 48px;
+    }
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+      margin-bottom: 48px;
+    }
+    .feature-card {
+      background: #16161e;
+      border: 1px solid #292e42;
+      border-radius: 12px;
+      padding: 24px;
+      text-align: center;
+      transition: all 0.3s;
+    }
+    .feature-card:hover {
+      border-color: #7aa2f7;
+      transform: translateY(-4px);
+      box-shadow: 0 8px 24px rgba(122, 162, 247, 0.1);
+    }
+    .feature-icon {
+      font-size: 36px;
+      margin-bottom: 12px;
+    }
+    .feature-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: #c0caf5;
+      margin-bottom: 8px;
+    }
+    .feature-desc {
+      font-size: 13px;
+      color: #565f89;
+    }
+    .tech-stack {
+      display: flex;
+      justify-content: center;
+      gap: 16px;
+      margin-bottom: 32px;
+    }
+    .tech-badge {
+      padding: 6px 16px;
+      background: #292e42;
+      border-radius: 20px;
+      font-size: 13px;
+      color: #7aa2f7;
+    }
+    .stats {
+      display: flex;
+      justify-content: center;
+      gap: 48px;
+      margin-bottom: 32px;
+    }
+    .stat {
+      text-align: center;
+    }
+    .stat-value {
+      font-size: 32px;
+      font-weight: 700;
+      color: #9ece6a;
+    }
+    .stat-label {
+      font-size: 13px;
+      color: #565f89;
+    }
+    .cta {
+      text-align: center;
+    }
+    .cta-btn {
+      display: inline-block;
+      padding: 12px 32px;
+      background: #7aa2f7;
+      color: #1a1b26;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      text-decoration: none;
+      transition: all 0.3s;
+    }
+    .cta-btn:hover {
+      background: #3a7ae8;
+      transform: translateY(-2px);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>MindVault</h1>
+    <p class="subtitle">本地优先的智能知识管理系统</p>
+
+    <div class="tech-stack">
+      <span class="tech-badge">C++17</span>
+      <span class="tech-badge">Crow</span>
+      <span class="tech-badge">SQLite3</span>
+      <span class="tech-badge">Vue 3</span>
+      <span class="tech-badge">TypeScript</span>
+      <span class="tech-badge">CodeMirror 6</span>
+      <span class="tech-badge">D3.js</span>
+    </div>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="stat-value">20+</div>
+        <div class="stat-label">REST API</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">15</div>
+        <div class="stat-label">Vue 组件</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">5</div>
+        <div class="stat-label">数据库表</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">15ms</div>
+        <div class="stat-label">API 响应</div>
+      </div>
+    </div>
+
+    <div class="feature-grid">
+      <div class="feature-card">
+        <div class="feature-icon">📝</div>
+        <div class="feature-title">Markdown 编辑</div>
+        <div class="feature-desc">CodeMirror 6 编辑器，三种模式，工具栏快捷键</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🔗</div>
+        <div class="feature-title">Wiki 双向链接</div>
+        <div class="feature-desc">[[标题]]语法，反向链接面板，知识图谱</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🔍</div>
+        <div class="feature-title">全文搜索</div>
+        <div class="feature-desc">SQLite FTS5 索引，毫秒级响应，高亮显示</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🤖</div>
+        <div class="feature-title">AI 智能问答</div>
+        <div class="feature-desc">RAG 检索增强，支持通义千问/豆包/OpenAI</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🃏</div>
+        <div class="feature-title">闪卡学习</div>
+        <div class="feature-desc">间隔重复算法，AI 自动生成，记忆曲线</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🕸️</div>
+        <div class="feature-title">知识图谱</div>
+        <div class="feature-desc">D3.js 力导向图，拖拽缩放，点击跳转</div>
+      </div>
+    </div>
+
+    <div class="cta">
+      <a href="http://localhost:5173" class="cta-btn">开始使用</a>
+    </div>
+  </div>
+</body>
+</html>
