@@ -9,6 +9,9 @@
 #include <memory>
 #include <string>
 #include <sstream>
+#include <mutex>
+#include <unordered_map>
+#include <algorithm>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -17,6 +20,40 @@
 #endif
 
 namespace mindvault::routes {
+
+// ─── 截断常量 ───
+constexpr int MAX_HISTORY_TURNS = 10;
+constexpr int MAX_CONTEXT_TOKENS = 8000;
+constexpr int SYSTEM_PROMPT_TOKENS = 200;
+
+// ─── 并发控制：会话级互斥锁 ───
+static std::mutex g_conv_mutex_map_mtx;
+static std::unordered_map<int, std::unique_ptr<std::mutex>> g_conv_mutexes;
+
+inline std::mutex& getConvMutex(int convId) {
+    std::lock_guard<std::mutex> g(g_conv_mutex_map_mtx);
+    auto& ptr = g_conv_mutexes[convId];
+    if (!ptr) ptr = std::make_unique<std::mutex>();
+    return *ptr;
+}
+
+// ─── Token 估算 ───
+inline int estimateTokens(const std::string& text) {
+    if (text.empty()) return 0;
+    return static_cast<int>(text.length() / 3) + 1;
+}
+
+// ─── 从 Authorization header 提取 user_id ───
+inline int64_t extractUserId(const crow::request& req) {
+    std::string token = req.get_header_value("Authorization");
+    if (token.empty() || token.size() < 8) return 0;
+    if (token.substr(0, 7) != "Bearer ") return 0;
+    token = token.substr(7);
+    auto pos = token.find('_');
+    if (pos == std::string::npos) return 0;
+    try { return std::stoll(token.substr(0, pos)); }
+    catch (...) { return 0; }
+}
 
 #ifdef _WIN32
 inline std::string HttpPost(const std::wstring& host, int port, const std::wstring& path, const std::string& body, const std::string& auth = "") {
@@ -71,19 +108,14 @@ inline std::string HttpPost(const std::wstring& host, int port, const std::wstri
     return response;
 }
 
-inline std::string CallOnlineAPI(const std::string& api_url, const std::string& api_key, const std::string& model, const std::string& prompt) {
-    // Parse URL: https://host:port/path
+// ─── 调用在线模型 API（会话模式用，传 messages 数组）───
+inline std::string CallOnlineAPIWithMessages(const std::string& api_url, const std::string& api_key, const std::string& model, const nlohmann::json& messages) {
     std::string url = api_url;
     int port = 443;
     bool is_https = true;
 
-    if (url.substr(0, 7) == "http://") {
-        url = url.substr(7);
-        is_https = false;
-        port = 80;
-    } else if (url.substr(0, 8) == "https://") {
-        url = url.substr(8);
-    }
+    if (url.substr(0, 7) == "http://") { url = url.substr(7); is_https = false; port = 80; }
+    else if (url.substr(0, 8) == "https://") { url = url.substr(8); }
 
     auto slash_pos = url.find('/');
     std::string host_str = (slash_pos != std::string::npos) ? url.substr(0, slash_pos) : url;
@@ -95,31 +127,343 @@ inline std::string CallOnlineAPI(const std::string& api_url, const std::string& 
     if (colon_pos != std::string::npos) {
         port = std::stoi(host_str.substr(colon_pos + 1));
         host_str = host_str.substr(0, colon_pos);
-    } else if (is_https) {
-        port = 443;
-    }
+    } else if (is_https) { port = 443; }
 
     std::wstring host(host_str.begin(), host_str.end());
 
-    // Build OpenAI-compatible request
     nlohmann::json req = {
         {"model", model},
-        {"messages", nlohmann::json::array({
-            {{"role", "system"}, {"content", "你是一个知识库助手。请基于参考资料回答问题。如果资料无法回答，请明确说明。"}},
-            {{"role", "user"}, {"content", prompt}}
-        })},
+        {"messages", messages},
         {"temperature", 0.7},
         {"max_tokens", 2000}
     };
 
     return HttpPost(host, port, path, req.dump(), api_key);
 }
+
+inline std::string CallOnlineAPI(const std::string& api_url, const std::string& api_key, const std::string& model, const std::string& prompt) {
+    nlohmann::json messages = {
+        {{"role", "system"}, {"content", "你是一个知识库助手。请基于参考资料回答问题。如果资料无法回答，请明确说明。"}},
+        {{"role", "user"}, {"content", prompt}}
+    };
+    return CallOnlineAPIWithMessages(api_url, api_key, model, messages);
+}
 #endif
+
+// ─── 构建历史消息（含截断）───
+inline nlohmann::json buildHistory(Database& db, int64_t convId, const std::string& systemPrompt, const std::string& ragContext, const std::string& currentQuestion) {
+    // 1. 取最近 N 轮（最多 20 条）
+    auto msgs = db.GetAIMessages(convId, MAX_HISTORY_TURNS * 2);
+
+    // 2. 固定部分 token 预算
+    int fixed = SYSTEM_PROMPT_TOKENS + estimateTokens(systemPrompt) + estimateTokens(ragContext) + estimateTokens(currentQuestion);
+    int budget = MAX_CONTEXT_TOKENS - fixed;
+    if (budget <= 0) {
+        std::cout << "[AI] Warning: budget <= 0, history will be empty" << std::endl;
+        return nlohmann::json::array();
+    }
+
+    // 3. 从最新往旧累加，直到预算用完
+    nlohmann::json kept = nlohmann::json::array();
+    int used = 0;
+    for (int i = static_cast<int>(msgs.size()) - 1; i >= 0; --i) {
+        auto& m = msgs[i];
+        int t = m.value("tokens", 0);
+        if (t <= 0) t = estimateTokens(m["content"].get<std::string>());
+        if (used + t > budget) break;
+        kept.push_back(m);
+        used += t;
+    }
+
+    // 4. 恢复正序
+    std::reverse(kept.begin(), kept.end());
+    return kept;
+}
+
+// ─── 构建发给模型的完整 messages 数组（会话模式）───
+inline nlohmann::json buildMessages(const nlohmann::json& history, const std::string& systemPrompt, const std::string& ragContext, const std::string& currentQuestion) {
+    nlohmann::json messages = nlohmann::json::array();
+
+    // 1. system prompt
+    messages.push_back({{"role", "system"}, {"content", systemPrompt}});
+
+    // 2. 历史对话
+    for (auto& h : history) {
+        messages.push_back({
+            {"role", h["role"]},
+            {"content", h["content"]}
+        });
+    }
+
+    // 3. 当前问题（含 RAG 上下文）
+    std::string userContent = "## 参考资料：\n" + ragContext + "\n## 问题：\n" + currentQuestion;
+    messages.push_back({{"role", "user"}, {"content", userContent}});
+
+    return messages;
+}
 
 inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
     auto search_svc = std::make_shared<services::SearchService>(db);
 
-    // GET /api/ai/status - check AI providers
+    // ──────────────────────────────────────────────
+    // 会话管理路由
+    // ──────────────────────────────────────────────
+
+    // GET /api/ai/conversations - 会话列表
+    CROW_ROUTE(app, "/api/ai/conversations").methods("GET"_method)
+    ([&db](const crow::request& req) {
+        int64_t uid = extractUserId(req);
+        if (uid <= 0) return crow::response(401, utils::Error("未登录").dump());
+        try {
+            auto list = db.GetAIConversations(uid);
+            return crow::response(utils::Success(list).dump());
+        } catch (const std::exception& e) {
+            return crow::response(500, utils::Error(e.what()).dump());
+        }
+    });
+
+    // POST /api/ai/conversations - 新建会话
+    CROW_ROUTE(app, "/api/ai/conversations").methods("POST"_method)
+    ([&db](const crow::request& req) {
+        int64_t uid = extractUserId(req);
+        if (uid <= 0) return crow::response(401, utils::Error("未登录").dump());
+        try {
+            std::string title = "新对话";
+            if (!req.body.empty()) {
+                auto body = nlohmann::json::parse(req.body);
+                title = body.value("title", title);
+            }
+            int64_t convId = db.CreateAIConversation(uid, title);
+            auto conv = db.GetAIConversation(convId, uid);
+            return crow::response(200, utils::Success(conv).dump());
+        } catch (const std::exception& e) {
+            return crow::response(500, utils::Error(e.what()).dump());
+        }
+    });
+
+    // GET /api/ai/conversations/:id - 会话详情（含消息历史）
+    CROW_ROUTE(app, "/api/ai/conversations/<int>").methods("GET"_method)
+    ([&db](const crow::request& req, int convId) {
+        int64_t uid = extractUserId(req);
+        if (uid <= 0) return crow::response(401, utils::Error("未登录").dump());
+        try {
+            auto conv = db.GetAIConversation(convId, uid);
+            if (conv.is_null()) return crow::response(404, utils::Error("会话不存在").dump());
+            auto msgs = db.GetAIMessages(convId, 500);
+            conv["messages"] = msgs;
+            return crow::response(utils::Success(conv).dump());
+        } catch (const std::exception& e) {
+            return crow::response(500, utils::Error(e.what()).dump());
+        }
+    });
+
+    // DELETE /api/ai/conversations/:id - 删除会话（软删）
+    CROW_ROUTE(app, "/api/ai/conversations/<int>").methods("DELETE"_method)
+    ([&db](const crow::request& req, int convId) {
+        int64_t uid = extractUserId(req);
+        if (uid <= 0) return crow::response(401, utils::Error("未登录").dump());
+        try {
+            bool ok = db.SoftDeleteAIConversation(convId, uid);
+            if (!ok) return crow::response(404, utils::Error("会话不存在").dump());
+            return crow::response(200, utils::Success().dump());
+        } catch (const std::exception& e) {
+            return crow::response(500, utils::Error(e.what()).dump());
+        }
+    });
+
+    // PUT /api/ai/conversations/:id - 重命名会话
+    CROW_ROUTE(app, "/api/ai/conversations/<int>").methods("PUT"_method)
+    ([&db](const crow::request& req, int convId) {
+        int64_t uid = extractUserId(req);
+        if (uid <= 0) return crow::response(401, utils::Error("未登录").dump());
+        try {
+            auto body = nlohmann::json::parse(req.body);
+            std::string title = body.value("title", "");
+            if (title.empty()) return crow::response(400, utils::Error("标题不能为空").dump());
+            bool ok = db.UpdateAIConversation(convId, uid, title);
+            if (!ok) return crow::response(404, utils::Error("会话不存在").dump());
+            return crow::response(200, utils::Success().dump());
+        } catch (const std::exception& e) {
+            return crow::response(500, utils::Error(e.what()).dump());
+        }
+    });
+
+    // ──────────────────────────────────────────────
+    // POST /api/ai/chat - AI 聊天（兼容单轮 + 多轮会话）
+    // ──────────────────────────────────────────────
+    CROW_ROUTE(app, "/api/ai/chat").methods("POST"_method)
+    ([search_svc, &db](const crow::request& req) {
+        try {
+            int64_t uid = extractUserId(req);
+            auto body = nlohmann::json::parse(req.body);
+            std::string question = body.value("question", std::string(""));
+            std::string provider = body.value("provider", std::string("ollama"));
+            std::string model = body.value("model", std::string("qwen-turbo"));
+            std::string api_key = body.value("api_key", std::string(""));
+            std::string api_url = body.value("api_url", std::string(""));
+            int64_t convId = body.value("conversation_id", int64_t(0));
+
+            std::cout << "[AI] Request: provider=" << provider << ", model=" << model
+                      << ", convId=" << convId << ", key=" << (api_key.empty() ? "empty" : "***") << std::endl;
+
+            if (question.empty()) {
+                return crow::response(400, utils::Error("Question is required").dump());
+            }
+
+            // RAG: 检索相关笔记
+            auto results = search_svc->Search(question, 5);
+
+            // 构建检索上下文
+            std::string ragContext;
+            for (size_t i = 0; i < results.size(); ++i) {
+                auto& r = results[i];
+                std::string title = r.value("title", std::string(""));
+                std::string snippet = r.value("content_highlight", std::string(""));
+                if (snippet.empty()) snippet = r.value("title_highlight", std::string(""));
+                size_t pos;
+                while ((pos = snippet.find(">>>")) != std::string::npos) snippet.replace(pos, 3, "");
+                while ((pos = snippet.find("<<<")) != std::string::npos) snippet.replace(pos, 3, "");
+                ragContext += "[来源" + std::to_string(i + 1) + ": " + title + "]\n" + snippet + "\n\n";
+            }
+
+            std::string systemPrompt = "你是一个知识库助手。请基于参考资料回答问题。如果资料无法回答，请明确说明。";
+            std::string answer;
+            int64_t msgId = 0;
+
+            // ── 会话模式 ──
+            if (convId > 0 && uid > 0) {
+                std::mutex& mtx = getConvMutex(convId);
+                std::lock_guard<std::mutex> lock(mtx);
+
+                db.Begin();
+                try {
+                    // 1. 校验归属
+                    auto conv = db.GetAIConversation(convId, uid);
+                    if (conv.is_null()) {
+                        db.Rollback();
+                        return crow::response(404, utils::Error("会话不存在或无权访问").dump());
+                    }
+
+                    // 2. 写入用户消息
+                    db.AddAIMessage(convId, "user", question, estimateTokens(question));
+
+                    // 3. 读取历史（截断）
+                    auto history = buildHistory(db, convId, systemPrompt, ragContext, question);
+
+                    // 4. 拼装 messages 数组
+                    auto messages = buildMessages(history, systemPrompt, ragContext, question);
+
+                    // 5. 调用模型
+#ifdef _WIN32
+                    if (provider == "ollama") {
+                        nlohmann::json ollama_req = {{"model", model}, {"prompt", systemPrompt + "\n\n" + question}, {"stream", false}};
+                        std::string res = HttpPost(L"localhost", 11434, L"/api/generate", ollama_req.dump());
+                        if (!res.empty()) {
+                            auto r = nlohmann::json::parse(res);
+                            answer = r.value("response", "");
+                        }
+                    } else {
+                        if (api_url.empty()) {
+                            if (provider == "tongyi") api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+                            else if (provider == "doubao") api_url = "https://ark.cn-beijing.volces.com/api/v3/chat/completions";
+                            else if (provider == "openai") api_url = "https://api.openai.com/v1/chat/completions";
+                        }
+                        if (!api_url.empty() && !api_key.empty()) {
+                            std::string res = CallOnlineAPIWithMessages(api_url, api_key, model, messages);
+                            if (!res.empty()) {
+                                try {
+                                    auto r = nlohmann::json::parse(res);
+                                    if (r.contains("choices") && r["choices"].size() > 0)
+                                        answer = r["choices"][0]["message"]["content"];
+                                    else if (r.contains("error"))
+                                        answer = "API 错误: " + r["error"].value("message", "Unknown");
+                                } catch (const std::exception& e) {
+                                    answer = "API 返回格式错误: " + res.substr(0, 200);
+                                }
+                            } else { answer = "API 请求失败，请检查网络连接"; }
+                        } else { answer = "请配置 API Key"; }
+                    }
+#endif
+
+                    if (answer.empty()) {
+                        answer = "无法获取 AI 回答。请检查 API Key 和网络连接。\n\n以下是 RAG 检索结果：\n\n" + ragContext;
+                    }
+
+                    // 6. 写入 assistant 消息
+                    msgId = db.AddAIMessage(convId, "assistant", answer, estimateTokens(answer));
+
+                    // 7. 更新会话标题（首轮自动截取前 20 字）
+                    if (conv.value("title", "") == "新对话" || conv.value("title", "").empty()) {
+                        std::string newTitle = question.length() > 20 ? question.substr(0, 20) : question;
+                        db.UpdateAIConversation(convId, uid, newTitle);
+                    }
+
+                    // 8. 更新 updated_at
+                    db.Execute(
+                        "UPDATE ai_conversations SET updated_at = datetime('now','localtime') WHERE id = ?",
+                        {convId}
+                    );
+
+                    db.Commit();
+                } catch (...) {
+                    db.Rollback();
+                    throw;
+                }
+
+            } else {
+                // ── 单轮兼容模式（现有逻辑，不写会话表）──
+                std::string prompt = "## 参考资料：\n" + ragContext + "\n## 问题：\n" + question;
+#ifdef _WIN32
+                if (provider == "ollama") {
+                    nlohmann::json ollama_req = {{"model", model}, {"prompt", "你是一个知识库助手。\n\n" + prompt}, {"stream", false}};
+                    std::string res = HttpPost(L"localhost", 11434, L"/api/generate", ollama_req.dump());
+                    if (!res.empty()) {
+                        auto r = nlohmann::json::parse(res);
+                        answer = r.value("response", "");
+                    }
+                } else {
+                    if (api_url.empty()) {
+                        if (provider == "tongyi") api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+                        else if (provider == "doubao") api_url = "https://ark.cn-beijing.volces.com/api/v3/chat/completions";
+                        else if (provider == "openai") api_url = "https://api.openai.com/v1/chat/completions";
+                    }
+                    if (!api_url.empty() && !api_key.empty()) {
+                        std::string res = CallOnlineAPI(api_url, api_key, model, prompt);
+                        if (!res.empty()) {
+                            try {
+                                auto r = nlohmann::json::parse(res);
+                                if (r.contains("choices") && r["choices"].size() > 0)
+                                    answer = r["choices"][0]["message"]["content"];
+                                else if (r.contains("error"))
+                                    answer = "API 错误: " + r["error"].value("message", "Unknown");
+                            } catch (const std::exception& e) {
+                                answer = "API 返回格式错误: " + res.substr(0, 200);
+                            }
+                        } else { answer = "API 请求失败，请检查网络连接"; }
+                    } else { answer = "请配置 API Key"; }
+                }
+#endif
+                if (answer.empty()) {
+                    answer = "无法获取 AI 回答。请检查 API Key 和网络连接。\n\n以下是 RAG 检索结果：\n\n" + ragContext;
+                }
+            }
+
+            nlohmann::json response = {
+                {"answer", answer},
+                {"sources", results},
+                {"provider", provider},
+                {"model", model},
+                {"conversation_id", convId},
+                {"message_id", msgId}
+            };
+            return crow::response(utils::Success(response).dump());
+        } catch (const std::exception& e) {
+            std::cout << "[AI] Error: " << e.what() << std::endl;
+            return crow::response(400, utils::Error(e.what()).dump());
+        }
+    });
+
+    // GET /api/ai/status - 检查 AI 提供商
     CROW_ROUTE(app, "/api/ai/status").methods("GET"_method)
     ([]() {
         nlohmann::json status = {
@@ -147,80 +491,6 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
 #endif
 
         return crow::response(utils::Success(status).dump());
-    });
-
-    // POST /api/ai/chat - AI chat with RAG
-    CROW_ROUTE(app, "/api/ai/chat").methods("POST"_method)
-    ([search_svc](const crow::request& req) {
-        try {
-            auto body = nlohmann::json::parse(req.body);
-            std::string question = body.value("question", std::string(""));
-            std::string provider = body.value("provider", std::string("ollama"));
-            std::string model = body.value("model", std::string("qwen-turbo"));
-            std::string api_key = body.value("api_key", std::string(""));
-            std::string api_url = body.value("api_url", std::string(""));
-
-            if (question.empty()) {
-                return crow::response(400, utils::Error("Question is required").dump());
-            }
-
-            // RAG: Search relevant notes
-            auto results = search_svc->Search(question, 5);
-
-            // Build context
-            std::string context;
-            for (size_t i = 0; i < results.size(); ++i) {
-                auto& r = results[i];
-                std::string title = r.value("title", std::string(""));
-                std::string snippet = r.value("content_highlight", std::string(""));
-                if (snippet.empty()) snippet = r.value("title_highlight", std::string(""));
-                size_t pos;
-                while ((pos = snippet.find(">>>")) != std::string::npos) snippet.replace(pos, 3, "");
-                while ((pos = snippet.find("<<<")) != std::string::npos) snippet.replace(pos, 3, "");
-                context += "[来源" + std::to_string(i + 1) + ": " + title + "]\n" + snippet + "\n\n";
-            }
-
-            std::string prompt = "## 参考资料：\n" + context + "\n## 问题：\n" + question;
-            std::string answer;
-
-#ifdef _WIN32
-            if (provider == "ollama") {
-                nlohmann::json ollama_req = {{"model", model}, {"prompt", "你是一个知识库助手。\n\n" + prompt}, {"stream", false}};
-                std::string res = HttpPost(L"localhost", 11434, L"/api/generate", ollama_req.dump());
-                if (!res.empty()) {
-                    auto r = nlohmann::json::parse(res);
-                    answer = r.value("response", "");
-                }
-            } else {
-                // Default URLs
-                if (api_url.empty()) {
-                    if (provider == "tongyi") api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
-                    else if (provider == "doubao") api_url = "https://ark.cn-beijing.volces.com/api/v3/chat/completions";
-                    else if (provider == "openai") api_url = "https://api.openai.com/v1/chat/completions";
-                }
-                if (!api_url.empty() && !api_key.empty()) {
-                    std::string res = CallOnlineAPI(api_url, api_key, model, prompt);
-                    if (!res.empty()) {
-                        auto r = nlohmann::json::parse(res);
-                        if (r.contains("choices") && r["choices"].size() > 0) {
-                            answer = r["choices"][0]["message"]["content"];
-                        } else if (r.contains("error")) {
-                            answer = "API 错误: " + r["error"].value("message", "Unknown");
-                        }
-                    }
-                }
-            }
-#endif
-
-            if (answer.empty()) {
-                answer = "无法获取 AI 回答。请检查：\n1. Ollama 是否运行\n2. API Key 是否正确\n\n以下是 RAG 检索结果：\n\n" + context;
-            }
-
-            nlohmann::json response = {{"answer", answer}, {"sources", results}, {"provider", provider}, {"model", model}};
-            return crow::response(utils::Success(response).dump());
-        } catch (const std::exception& e) {
-            return crow::response(400, utils::Error(e.what()).dump());
-        }
     });
 }
 
