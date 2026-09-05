@@ -282,10 +282,6 @@ function relativeTime(dateStr: string): string {
   if (diff < 86400) return Math.floor(diff / 3600) + '小时前'
   return Math.floor(diff / 86400) + '天前'
 }
-
-function truncate(str: string, len: number): string {
-  return str.length > len ? str.substring(0, len) + '...' : str
-}
 </script>
 
 <template>
