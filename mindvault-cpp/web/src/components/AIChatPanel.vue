@@ -198,8 +198,9 @@ async function sendMessage() {
   }
 
   // 乐观更新：立即显示用户消息
+  const userMsgId = Date.now()
   const userMsg: ChatMessage = {
-    id: Date.now(),
+    id: userMsgId,
     role: 'user',
     content: question,
     tokens: 0,
@@ -246,11 +247,23 @@ async function sendMessage() {
       await loadConversations()
       await nextTick()
       scrollToBottom()
+    } else {
+      // API 返回错误，移除乐观更新的用户消息，显示错误
+      messages.value = messages.value.filter(m => m.id !== userMsgId)
+      messages.value.push({
+        id: Date.now(),
+        role: 'assistant',
+        content: data.error?.message || '请求失败',
+        tokens: 0,
+        created_at: new Date().toISOString(),
+      })
     }
   } catch (e) {
     console.error('AI chat failed:', e)
+    // 网络错误，移除乐观更新的用户消息，显示错误
+    messages.value = messages.value.filter(m => m.id !== userMsgId)
     messages.value.push({
-      id: Date.now() + 1,
+      id: Date.now(),
       role: 'assistant',
       content: '请求失败，请检查后端服务。',
       tokens: 0,

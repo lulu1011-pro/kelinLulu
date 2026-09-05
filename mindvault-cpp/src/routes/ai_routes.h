@@ -151,6 +151,9 @@ inline std::string CallOnlineAPI(const std::string& api_url, const std::string& 
 #endif
 
 // ─── 构建历史消息（含截断）───
+// 策略：从最新往旧累加 token，超预算就停。最后 reverse 恢复正序。
+// 这样做的原因是：我们需要保留最近的消息，丢弃最旧的，
+// 从后往前遍历 + break 是最自然的写法，最后 reverse 一次即可。
 inline nlohmann::json buildHistory(Database& db, int64_t convId, const std::string& systemPrompt, const std::string& ragContext, const std::string& currentQuestion) {
     // 1. 取最近 N 轮（最多 20 条）
     auto msgs = db.GetAIMessages(convId, MAX_HISTORY_TURNS * 2);
@@ -459,6 +462,11 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
             return crow::response(utils::Success(response).dump());
         } catch (const std::exception& e) {
             std::cout << "[AI] Error: " << e.what() << std::endl;
+            std::string msg = e.what();
+            // 数据库忙时返回友好提示，不暴露技术细节
+            if (msg.find("SQL error") != std::string::npos || msg.find("SQLITE_BUSY") != std::string::npos) {
+                return crow::response(500, utils::Error("服务繁忙，请稍后重试").dump());
+            }
             return crow::response(400, utils::Error(e.what()).dump());
         }
     });
