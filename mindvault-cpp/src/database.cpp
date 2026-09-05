@@ -40,11 +40,45 @@ Database::~Database() {
     }
 }
 
+Database::Database(const std::filesystem::path& db_path) {
+    // 直接用宽字符路径打开，避免中文编码问题
+    int rc;
+#ifdef _WIN32
+    rc = sqlite3_open16(db_path.wstring().c_str(), &db_);
+#else
+    rc = sqlite3_open(db_path.string().c_str(), &db_);
+#endif
+    if (rc != SQLITE_OK) {
+        std::string err = "Cannot open database: " + std::string(sqlite3_errmsg(db_));
+        sqlite3_close(db_);
+        db_ = nullptr;
+        throw std::runtime_error(err);
+    }
+    Execute("PRAGMA journal_mode=WAL");
+    Execute("PRAGMA foreign_keys=ON");
+    // 输出实际路径用于调试
+    std::cout << "[DB] Opened: " << db_path.u8string() << std::endl;
+}
+
 void Database::Init() {
+    // ─── 用户表 ───
+    Execute(R"(
+        CREATE TABLE IF NOT EXISTS users (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            username    TEXT NOT NULL UNIQUE,
+            password    TEXT NOT NULL,
+            nickname    TEXT DEFAULT '',
+            avatar      TEXT DEFAULT '',
+            created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        )
+    )");
+
     // ─── 笔记表 ───
     Execute(R"(
         CREATE TABLE IF NOT EXISTS notes (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER DEFAULT 0,
             title       TEXT NOT NULL DEFAULT '',
             content     TEXT NOT NULL DEFAULT '',
             folder      TEXT NOT NULL DEFAULT 'default',
@@ -73,6 +107,19 @@ void Database::Init() {
         Execute("UPDATE notes SET sort_order = id");
     }
     Execute("DROP TABLE IF EXISTS _migration_check");
+
+    // 迁移：添加 user_id 列（如果不存在）
+    bool has_user_id = false;
+    auto cols2 = Query("PRAGMA table_info(notes)");
+    for (auto& col : cols2) {
+        if (col["name"].get<std::string>() == "user_id") {
+            has_user_id = true;
+            break;
+        }
+    }
+    if (!has_user_id) {
+        Execute("ALTER TABLE notes ADD COLUMN user_id INTEGER DEFAULT 0");
+    }
 
     // ─── 标签表 ───
     Execute(R"(
@@ -114,39 +161,77 @@ void Database::Init() {
     )");
     Execute("CREATE INDEX IF NOT EXISTS idx_versions_note ON versions(note_id)");
 
-    // ─── FTS5 全文搜索虚拟表 ───
-    // 使用独立存储模式（非 content=notes），更可靠
+    // ─── 闪卡表 ───
     Execute(R"(
-        CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts
-        USING fts5(title, content)
+        CREATE TABLE IF NOT EXISTS flashcards (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            note_id       INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+            front         TEXT NOT NULL,
+            back          TEXT NOT NULL,
+            ease_factor   REAL DEFAULT 2.5,
+            interval_days INTEGER DEFAULT 0,
+            next_review   TEXT,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        )
+    )");
+    Execute("CREATE INDEX IF NOT EXISTS idx_flashcards_review ON flashcards(next_review)");
+
+    // ─── 权限表 ───
+    Execute(R"(
+        CREATE TABLE IF NOT EXISTS permissions (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            note_id     INTEGER NOT NULL,
+            user_id     INTEGER NOT NULL,
+            role        TEXT NOT NULL DEFAULT 'viewer',
+            created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            UNIQUE(note_id, user_id)
+        )
+    )");
+    Execute("CREATE INDEX IF NOT EXISTS idx_permissions_note ON permissions(note_id)");
+    Execute("CREATE INDEX IF NOT EXISTS idx_permissions_user ON permissions(user_id)");
+
+// ─── FTS5 全文搜索虚拟表 ───
+    Execute(R"(
+        CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(title, content)
     )");
 
-    // ─── FTS5 同步触发器 ───
-    // INSERT 时同步
-    Execute(R"(
-        CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
-            INSERT INTO notes_fts(rowid, title, content)
-            VALUES (new.id, new.title, new.content);
-        END
-    )");
-    // UPDATE 时同步
-    Execute(R"(
-        CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
-            INSERT INTO notes_fts(notes_fts, rowid, title, content)
-            VALUES ('delete', old.id, old.title, old.content);
-            INSERT INTO notes_fts(rowid, title, content)
-            VALUES (new.id, new.title, new.content);
-        END
-    )");
-    // DELETE 时同步
-    Execute(R"(
-        CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
-            INSERT INTO notes_fts(notes_fts, rowid, title, content)
-            VALUES ('delete', old.id, old.title, old.content);
-        END
-    )");
+    // ─── FTS5 同步 ───
+    // 注：不再使用触发器，改由 NoteService 层手动同步，更可靠
+    // 旧触发器如存在则删除
+    Execute("DROP TRIGGER IF EXISTS notes_ai");
+    Execute("DROP TRIGGER IF EXISTS notes_au");
+    Execute("DROP TRIGGER IF EXISTS notes_ad");
 
-    std::cout << "[DB] Schema initialized (notes, tags, note_tags, link_edges, notes_fts)" << std::endl;
+    // ─── AI 会话表 ───
+    Execute(R"(
+        CREATE TABLE IF NOT EXISTS ai_conversations (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            title       TEXT NOT NULL DEFAULT '新对话',
+            is_deleted  INTEGER NOT NULL DEFAULT 0,
+            deleted_at  TEXT DEFAULT NULL,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    )");
+    Execute("CREATE INDEX IF NOT EXISTS idx_ai_conversations_user ON ai_conversations(user_id, updated_at DESC) WHERE is_deleted = 0");
+
+    // ─── AI 消息表 ───
+    Execute(R"(
+        CREATE TABLE IF NOT EXISTS ai_messages (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id  INTEGER NOT NULL,
+            role             TEXT NOT NULL CHECK (role IN ('user','assistant')),
+            content          TEXT NOT NULL,
+            tokens           INTEGER DEFAULT 0,
+            created_at       TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY (conversation_id) REFERENCES ai_conversations(id) ON DELETE CASCADE
+        )
+    )");
+    Execute("CREATE INDEX IF NOT EXISTS idx_ai_messages_conv ON ai_messages(conversation_id, created_at)");
+
+    std::cout << "[DB] Schema initialized (notes, tags, note_tags, link_edges, notes_fts, ai_conversations, ai_messages)" << std::endl;
 }
 
 // ─── 基础执行 ───
@@ -165,14 +250,21 @@ void Database::Execute(const std::string& sql, const std::vector<nlohmann::json>
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        throw std::runtime_error("Prepare failed: " + std::string(sqlite3_errmsg(db_)));
+        std::string err = sqlite3_errmsg(db_);
+        std::cerr << "[DB] Prepare failed for SQL: " << sql << std::endl;
+        std::cerr << "[DB] Error: " << err << std::endl;
+        throw std::runtime_error("Prepare failed: " + err);
     }
     BindParams(stmt, params);
     rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
-        throw std::runtime_error("Execute failed: " + std::string(sqlite3_errmsg(db_)));
+        std::string err = sqlite3_errmsg(db_);
+        std::cerr << "[DB] Execute failed for SQL: " << sql << std::endl;
+        std::cerr << "[DB] Error: " << err << std::endl;
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("Execute failed: " + err);
     }
+    sqlite3_finalize(stmt);
 }
 
 // ─── 查询 ───
@@ -210,6 +302,61 @@ void Database::Rollback() { Execute("ROLLBACK"); }
 
 int64_t Database::LastInsertId() { return sqlite3_last_insert_rowid(db_); }
 int     Database::Changes()      { return sqlite3_changes(db_); }
+
+// ─── AI 会话操作 ───
+
+int64_t Database::CreateAIConversation(int64_t user_id, const std::string& title) {
+    Execute("INSERT INTO ai_conversations (user_id, title) VALUES (?, ?)", {user_id, title});
+    return LastInsertId();
+}
+
+nlohmann::json Database::GetAIConversations(int64_t user_id) {
+    return Query(
+        "SELECT id, title, updated_at, created_at, "
+        "(SELECT COUNT(*) FROM ai_messages WHERE conversation_id = ai_conversations.id) AS message_count "
+        "FROM ai_conversations WHERE user_id = ? AND is_deleted = 0 ORDER BY updated_at DESC",
+        {user_id}
+    );
+}
+
+nlohmann::json Database::GetAIConversation(int64_t conversation_id, int64_t user_id) {
+    return QueryOne(
+        "SELECT id, title, updated_at, created_at, "
+        "(SELECT COUNT(*) FROM ai_messages WHERE conversation_id = ai_conversations.id) AS message_count "
+        "FROM ai_conversations WHERE id = ? AND user_id = ? AND is_deleted = 0",
+        {conversation_id, user_id}
+    );
+}
+
+bool Database::UpdateAIConversation(int64_t conversation_id, int64_t user_id, const std::string& title) {
+    Execute(
+        "UPDATE ai_conversations SET title = ?, updated_at = datetime('now','localtime') WHERE id = ? AND user_id = ? AND is_deleted = 0",
+        {title, conversation_id, user_id}
+    );
+    return Changes() > 0;
+}
+
+bool Database::SoftDeleteAIConversation(int64_t conversation_id, int64_t user_id) {
+    Execute(
+        "UPDATE ai_conversations SET is_deleted = 1, deleted_at = datetime('now','localtime'), updated_at = datetime('now','localtime') WHERE id = ? AND user_id = ?",
+        {conversation_id, user_id}
+    );
+    return Changes() > 0;
+}
+
+// ─── AI 消息操作 ───
+
+int64_t Database::AddAIMessage(int64_t conversation_id, const std::string& role, const std::string& content, int tokens) {
+    Execute("INSERT INTO ai_messages (conversation_id, role, content, tokens) VALUES (?, ?, ?, ?)", {conversation_id, role, content, tokens});
+    return LastInsertId();
+}
+
+nlohmann::json Database::GetAIMessages(int64_t conversation_id, int limit) {
+    return Query(
+        "SELECT id, role, content, tokens, created_at FROM ai_messages WHERE conversation_id = ? ORDER BY created_at ASC LIMIT ?",
+        {conversation_id, limit}
+    );
+}
 
 // ─── 内部方法 ───
 

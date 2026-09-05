@@ -9,12 +9,14 @@
 #include <functional>
 #include <stdexcept>
 #include <memory>
+#include <filesystem>
 
 namespace mindvault {
 
 class Database {
 public:
     explicit Database(const std::string& db_path);
+    explicit Database(const std::filesystem::path& db_path);
     ~Database();
 
     // 禁止拷贝
@@ -51,6 +53,17 @@ public:
 
     // 获取原生句柄（高级用法）
     sqlite3* Handle() { return db_; }
+
+    // ─── AI 会话操作 ───
+    int64_t CreateAIConversation(int64_t user_id, const std::string& title = "新对话");
+    nlohmann::json GetAIConversations(int64_t user_id);
+    nlohmann::json GetAIConversation(int64_t conversation_id, int64_t user_id);
+    bool UpdateAIConversation(int64_t conversation_id, int64_t user_id, const std::string& title);
+    bool SoftDeleteAIConversation(int64_t conversation_id, int64_t user_id);
+
+    // ─── AI 消息操作 ───
+    int64_t AddAIMessage(int64_t conversation_id, const std::string& role, const std::string& content, int tokens = 0);
+    nlohmann::json GetAIMessages(int64_t conversation_id, int limit = 50);
 
 private:
     sqlite3* db_ = nullptr;
