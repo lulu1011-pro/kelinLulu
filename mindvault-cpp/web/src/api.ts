@@ -2,9 +2,21 @@
 
 const API_BASE = '/api'
 
+function getToken(): string | null {
+  return localStorage.getItem('token')
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  }
+  const token = getToken()
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     ...options,
   })
   const json = await res.json()
@@ -15,6 +27,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 // ─── Types ───
+
+export interface User {
+  id: number
+  username: string
+  nickname: string
+  token?: string
+}
 
 export interface Note {
   id: number
@@ -105,6 +124,68 @@ export interface Version {
   created_at: string
 }
 
+// ─── AI Conversations ───
+
+export interface Conversation {
+  id: number
+  title: string
+  updated_at: string
+  message_count: number
+}
+
+export interface ConversationDetail extends Conversation {
+  messages: ChatMessage[]
+}
+
+export interface ChatMessage {
+  id: number
+  role: 'user' | 'assistant'
+  content: string
+  tokens: number
+  created_at: string
+}
+
+export interface ChatRequest {
+  question: string
+  provider: string
+  model: string
+  api_key: string
+  api_url?: string
+  conversation_id?: number
+}
+
+export interface ChatResponse {
+  answer: string
+  sources: SearchResult[]
+  provider: string
+  model: string
+  conversation_id: number
+  message_id: number
+}
+
+export const conversationsApi = {
+  list: () =>
+    request<Conversation[]>('/ai/conversations'),
+
+  create: (title?: string) =>
+    request<Conversation>('/ai/conversations', {
+      method: 'POST',
+      body: JSON.stringify({ title }),
+    }),
+
+  get: (id: number) =>
+    request<ConversationDetail>(`/ai/conversations/${id}`),
+
+  delete: (id: number) =>
+    request<void>(`/ai/conversations/${id}`, { method: 'DELETE' }),
+
+  rename: (id: number, title: string) =>
+    request<void>(`/ai/conversations/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ title }),
+    }),
+}
+
 // ─── Search ───
 
 export const searchApi = {
@@ -128,7 +209,7 @@ export const tagsApi = {
     request<void>(`/notes/${noteId}/tags`, { method: 'DELETE', body: JSON.stringify({ name: tagName }) }),
 
   getNoteTags: (noteId: number) =>
-    request<Tag[]>(`/notes/${noteId}/tags`),
+    request<Tag[]>(`/notes/${noteId}/tags`, { method: 'GET' }),
 
   getNotesByTag: (tagName: string) =>
     request<Note[]>(`/tags/${encodeURIComponent(tagName)}/notes`),
@@ -139,6 +220,9 @@ export const tagsApi = {
 export const filesApi = {
   exportNote: (id: number) =>
     `${API_BASE}/files/export/${id}`,
+
+  exportHtml: (id: number) =>
+    `${API_BASE}/files/export-html/${id}`,
 
   importFile: (data: { filename: string; content: string; folder?: string }) =>
     request<Note>('/files/import', { method: 'POST', body: JSON.stringify(data) }),
@@ -154,4 +238,105 @@ export const filesApi = {
     if (!json.ok) throw new Error(json.error?.message || 'Upload failed')
     return json.data as { url: string; filename: string }
   },
+
+  uploadBase64: async (dataUrl: string): Promise<{ url: string; filename: string }> => {
+    const token = localStorage.getItem('token')
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (token) headers['Authorization'] = `Bearer ${token}`
+    const res = await fetch(`${API_BASE}/upload/base64`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ image: dataUrl }),
+    })
+    const json = await res.json()
+    if (!json.ok) throw new Error(json.error?.message || 'Upload failed')
+    return json.data as { url: string; filename: string }
+  },
+}
+
+// ─── Flashcards ───
+
+export interface Flashcard {
+  id: number
+  note_id: number
+  front: string
+  back: string
+  ease_factor: number
+  interval_days: number
+  next_review: string | null
+  created_at: string
+  note_title?: string
+}
+
+export const flashcardsApi = {
+  getByNote: (noteId: number) =>
+    request<Flashcard[]>(`/notes/${noteId}/flashcards`),
+
+  create: (data: { note_id: number; front: string; back: string }) =>
+    request<Flashcard>('/flashcards', { method: 'POST', body: JSON.stringify(data) }),
+
+  update: (id: number, data: { front: string; back: string }) =>
+    request<Flashcard>(`/flashcards/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+
+  delete: (id: number) =>
+    request<void>(`/flashcards/${id}`, { method: 'DELETE' }),
+
+  getDue: () =>
+    request<Flashcard[]>('/flashcards/due'),
+
+  review: (id: number, quality: number) =>
+    request<Flashcard>(`/flashcards/${id}/review`, { method: 'POST', body: JSON.stringify({ quality }) }),
+}
+
+// ─── Auth ───
+
+export const authApi = {
+  login: (username: string, password: string) =>
+    request<User>('/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
+
+  register: (username: string, password: string, nickname?: string) =>
+    request<User>('/auth/register', { method: 'POST', body: JSON.stringify({ username, password, nickname }) }),
+
+  me: () =>
+    request<User>('/auth/me'),
+}
+
+// ─── Collab ───
+
+export const collabApi = {
+  join: (noteId: number) =>
+    request<void>(`/notes/${noteId}/join`, { method: 'POST' }),
+
+  leave: (noteId: number) =>
+    request<void>(`/notes/${noteId}/leave`, { method: 'POST' }),
+
+  heartbeat: (noteId: number) =>
+    request<void>(`/notes/${noteId}/heartbeat`, { method: 'POST' }),
+
+  viewers: (noteId: number) =>
+    request<{ id: number; username: string }[]>(`/notes/${noteId}/viewers`),
+}
+
+// ─── Share ───
+
+export const shareApi = {
+  importNote: (code: string) =>
+    request<Note>(`/share/${code}/import`, { method: 'POST' }),
+}
+
+// ─── Drawings ───
+
+export interface Drawing {
+  id: number
+  note_id: number
+  url: string
+  created_at: string
+}
+
+export const drawingsApi = {
+  save: (noteId: number, imageData: string) =>
+    request<{ url: string; filename: string }>('/drawings', {
+      method: 'POST',
+      body: JSON.stringify({ note_id: noteId, image_data: imageData }),
+    }),
 }
