@@ -10,7 +10,19 @@
 
 namespace mindvault::utils {
 
-// Convert wide path to UTF-8 string (Windows-safe)
+// UTF-8 string → filesystem::path（Windows 中文路径）
+inline std::filesystem::path Utf8ToPath(const std::string& s) {
+#ifdef _WIN32
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring ws(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &ws[0], wlen);
+    return std::filesystem::path(ws);
+#else
+    return std::filesystem::path(s);
+#endif
+}
+
+// filesystem::path → UTF-8 string
 inline std::string PathToUtf8(const std::filesystem::path& p) {
 #ifdef _WIN32
     auto ws = p.wstring();
@@ -24,9 +36,9 @@ inline std::string PathToUtf8(const std::filesystem::path& p) {
 }
 
 struct Config {
-    std::string db_path;
-    std::string web_dir;
-    std::string host = "127.0.0.1";
+    std::filesystem::path db_path_fs;
+    std::filesystem::path web_dir_fs;
+    std::string host = "0.0.0.0";
     int port = 8080;
 
     static Config& Instance() {
@@ -35,12 +47,15 @@ struct Config {
     }
 
     void Init(const std::string& base_dir) {
-        std::filesystem::path base(base_dir);
-        db_path = PathToUtf8(base / "data" / "mindvault.db");
-        web_dir = PathToUtf8(base / "web");
-        // Ensure data directory exists
+        InitFromPath(Utf8ToPath(base_dir));
+    }
+
+    void InitFromPath(const std::filesystem::path& base) {
+        db_path_fs = base / "data" / "mindvault.db";
+        web_dir_fs = base / "web";
+        // 确保 data 目录存在
         std::error_code ec;
-        std::filesystem::create_directories(base / "data", ec);
+        std::filesystem::create_directories(db_path_fs.parent_path(), ec);
         if (ec) {
             std::cerr << "[Config] Warning: cannot create data dir: " << ec.message() << std::endl;
         }

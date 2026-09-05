@@ -11,9 +11,33 @@ class SearchService {
 public:
     explicit SearchService(Database& db) : db_(db) {}
 
+    // 转义 FTS5 特殊字符
+    static std::string EscapeFTS5(const std::string& query) {
+        std::string result;
+        for (char c : query) {
+            // 只保留字母、数字、中文和空格
+            if (std::isalnum(c) || c == ' ' || c == '\t' || c == '\n' ||
+                (c & 0x80)) {  // UTF-8 多字节字符
+                result += c;
+            }
+            // 其他字符替换为空格
+            else if (result.empty() || result.back() != ' ') {
+                result += ' ';
+            }
+        }
+        // 去除首尾空格
+        size_t start = result.find_first_not_of(' ');
+        size_t end = result.find_last_not_of(' ');
+        if (start == std::string::npos) return "";
+        return result.substr(start, end - start + 1);
+    }
+
     // FTS5 全文搜索，返回匹配笔记列表
     nlohmann::json Search(const std::string& query, int limit = 50) {
         if (query.empty()) return nlohmann::json::array();
+
+        // 转义特殊字符
+        std::string escaped_query = EscapeFTS5(query);
 
         // FTS5 MATCH 语法：默认按 OR 匹配关键词
         return db_.Query(R"(
@@ -25,7 +49,7 @@ public:
             WHERE notes_fts MATCH ? AND n.is_deleted = 0
             ORDER BY rank
             LIMIT ?
-        )", {query, limit});
+        )", {escaped_query, limit});
     }
 
     // 按标题模糊搜索（非全文索引，走 LIKE）

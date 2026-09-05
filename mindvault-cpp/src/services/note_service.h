@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <regex>
+#include <iostream>
 #include <nlohmann/json.hpp>
 
 namespace mindvault::services {
@@ -69,6 +70,12 @@ public:
             {title, content, folder}
         );
         int64_t new_id = db_.LastInsertId();
+        
+        // 同步 FTS5
+        try {
+            db_.Execute("INSERT INTO notes_fts(rowid, title, content) VALUES (?, ?, ?)", {new_id, title, content});
+        } catch (...) {}
+        
         // 更新链接关系
         UpdateLinks(new_id, content);
         return GetById(new_id);
@@ -76,12 +83,19 @@ public:
 
     // 更新笔记
     nlohmann::json Update(int64_t id, const std::string& title, const std::string& content, const std::string& folder = "") {
-        // 保存版本历史
-        auto current = GetById(id);
-        if (!current.is_null()) {
-            SaveVersion(id, current["title"].get<std::string>(), current["content"].get<std::string>());
+        // 先手动同步 FTS5（删除旧记录）
+        try {
+            auto old = GetById(id);
+            if (!old.is_null()) {
+                std::string old_title = old.value("title", "");
+                std::string old_content = old.value("content", "");
+                db_.Execute("DELETE FROM notes_fts WHERE rowid = ?", {id});
+            }
+        } catch (...) {
+            // FTS5 操作失败不影响主表更新
         }
-
+        
+        // 更新主表
         if (!folder.empty()) {
             db_.Execute(
                 "UPDATE notes SET title = ?, content = ?, folder = ?, updated_at = datetime('now','localtime') WHERE id = ? AND is_deleted = 0",
@@ -93,13 +107,25 @@ public:
                 {title, content, id}
             );
         }
-        // 更新链接关系
+        
+        // 同步 FTS5（插入新记录）
+        try {
+            db_.Execute("INSERT INTO notes_fts(rowid, title, content) VALUES (?, ?, ?)", {id, title, content});
+        } catch (...) {
+            // FTS5 操作失败不影响主表更新
+        }
+        
         UpdateLinks(id, content);
         return GetById(id);
     }
 
     // 软删除笔记
     bool Delete(int64_t id) {
+        // 先清理 FTS5
+        try {
+            db_.Execute("DELETE FROM notes_fts WHERE rowid = ?", {id});
+        } catch (...) {}
+        
         db_.Execute(
             "UPDATE notes SET is_deleted = 1, updated_at = datetime('now','localtime') WHERE id = ?",
             {id}
@@ -118,11 +144,23 @@ public:
 
     // 恢复笔记
     nlohmann::json Restore(int64_t id) {
+        auto note = db_.QueryOne(
+            "SELECT id, title, content, folder FROM notes WHERE id = ? AND is_deleted = 1",
+            {id}
+        );
+        if (note.is_null()) return nullptr;
+        
         db_.Execute(
             "UPDATE notes SET is_deleted = 0, updated_at = datetime('now','localtime') WHERE id = ? AND is_deleted = 1",
             {id}
         );
-        if (db_.Changes() == 0) return nullptr;
+        
+        // 重新同步 FTS5
+        try {
+            db_.Execute("INSERT INTO notes_fts(rowid, title, content) VALUES (?, ?, ?)",
+                {id, note["title"].get<std::string>(), note["content"].get<std::string>()});
+        } catch (...) {}
+        
         return db_.QueryOne(
             "SELECT id, title, content, folder, is_deleted, created_at, updated_at FROM notes WHERE id = ?",
             {id}
@@ -131,12 +169,18 @@ public:
 
     // 永久删除笔记
     bool PermanentDelete(int64_t id) {
+        // 先清理 FTS5
+        try { db_.Execute("DELETE FROM notes_fts WHERE rowid = ?", {id}); } catch (...) {}
+        
         db_.Execute("DELETE FROM notes WHERE id = ? AND is_deleted = 1", {id});
         return db_.Changes() > 0;
     }
 
     // 清空回收站
     int EmptyTrash() {
+        // 先清理 FTS5
+        try { db_.Execute("DELETE FROM notes_fts WHERE rowid IN (SELECT id FROM notes WHERE is_deleted = 1)"); } catch (...) {}
+        
         db_.Execute("DELETE FROM notes WHERE is_deleted = 1");
         return db_.Changes();
     }
@@ -206,11 +250,15 @@ private:
     // 从内容中提取 [[标题]] 格式的 Wiki 链接
     std::vector<std::string> ExtractWikiLinks(const std::string& content) {
         std::vector<std::string> links;
-        std::regex re(R"(\[\[([^\]]+)\]\])");
-        auto begin = std::sregex_iterator(content.begin(), content.end(), re);
-        auto end = std::sregex_iterator();
-        for (auto it = begin; it != end; ++it) {
-            links.push_back((*it)[1].str());
+        try {
+            std::regex re(R"(\[\[([^\]]+)\]\])");
+            auto begin = std::sregex_iterator(content.begin(), content.end(), re);
+            auto end = std::sregex_iterator();
+            for (auto it = begin; it != end; ++it) {
+                links.push_back((*it)[1].str());
+            }
+        } catch (...) {
+            // regex 失败时返回空
         }
         return links;
     }

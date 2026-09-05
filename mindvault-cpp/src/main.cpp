@@ -6,14 +6,16 @@
 #include "routes/search_routes.h"
 #include "routes/file_routes.h"
 #include "routes/ai_routes.h"
+#include "routes/flashcard_routes.h"
+#include "routes/user_routes.h"
+#include "routes/share_routes.h"
+#include "routes/collab_routes.h"
+#include "routes/perm_routes.h"
 #include "utils/config.h"
 #include "crow_all.h"
 #include <iostream>
 #include <filesystem>
 #include <cstdlib>
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 using namespace mindvault;
 
@@ -26,21 +28,17 @@ int main() {
     // Init config
     auto& cfg = utils::Config::Instance();
     char* base_env = std::getenv("MINDVAULT_HOME");
-    std::string base_dir;
+    std::filesystem::path base_path;
     if (base_env) {
-        base_dir = base_env;
+        base_path = utils::Utf8ToPath(std::string(base_env));
     } else {
-        // current_path() returns wide path on Windows; convert to UTF-8
-        auto wp = std::filesystem::current_path().wstring();
-        int len = WideCharToMultiByte(CP_UTF8, 0, wp.c_str(), -1, nullptr, 0, nullptr, nullptr);
-        base_dir.resize(len - 1);
-        WideCharToMultiByte(CP_UTF8, 0, wp.c_str(), -1, &base_dir[0], len, nullptr, nullptr);
+        base_path = std::filesystem::current_path();
     }
-    cfg.Init(base_dir);
-    std::cout << "[Config] Base dir: " << base_dir << std::endl;
+    cfg.InitFromPath(base_path);
+    std::cout << "[Config] Base dir: " << cfg.web_dir_fs.parent_path().string() << std::endl;
 
-    // Init database
-    Database db(cfg.db_path);
+    // Init database（用 filesystem::path 打开，支持中文路径）
+    Database db(cfg.db_path_fs);
     db.Init();
 
     // Create Crow app
@@ -53,7 +51,7 @@ int main() {
         crow::response res;
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
         res.code = 204;
         return res;
     });
@@ -63,12 +61,19 @@ int main() {
     routes::RegisterSearchRoutes(app, db);
     routes::RegisterFileRoutes(app, db);
     routes::RegisterAIRoutes(app, db);
+    routes::RegisterFlashcardRoutes(app, db);
+    routes::RegisterUserRoutes(app, db);
+    routes::RegisterShareRoutes(app, db);
+    routes::RegisterCollabRoutes(app, db);
+    routes::RegisterPermRoutes(app, db);
 
     // Static file serving for uploaded images
-    std::string uploads_dir = std::filesystem::path(cfg.web_dir).parent_path().string() + "/uploads";
+    auto uploads_dir = cfg.web_dir_fs.parent_path() / "uploads";
+    std::filesystem::create_directories(uploads_dir);
+    std::cout << "[Static] Uploads dir: " << uploads_dir.string() << std::endl;
     CROW_ROUTE(app, "/uploads/<path>")
     ([uploads_dir](const crow::request&, std::string file_path) {
-        std::string full_path = uploads_dir + "/" + file_path;
+        auto full_path = uploads_dir / file_path;
         if (!std::filesystem::exists(full_path)) {
             return crow::response(404, "File not found");
         }
@@ -78,8 +83,6 @@ int main() {
         }
         std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
         crow::response res(content);
-
-        // 设置 Content-Type
         auto ext_pos = file_path.rfind('.');
         if (ext_pos != std::string::npos) {
             std::string ext = file_path.substr(ext_pos + 1);
@@ -94,14 +97,12 @@ int main() {
     });
 
     // Static file serving for frontend (web/dist)
-    std::string dist_dir = cfg.web_dir + "/dist";
+    auto dist_dir = cfg.web_dir_fs / "dist";
     if (std::filesystem::exists(dist_dir)) {
-        std::cout << "[Static] Serving frontend from: " << dist_dir << std::endl;
-
-        // Serve index.html for root
+        std::cout << "[Static] Serving frontend from: " << dist_dir.string() << std::endl;
         CROW_ROUTE(app, "/app")
         ([dist_dir]() {
-            std::string index_path = dist_dir + "/index.html";
+            auto index_path = dist_dir / "index.html";
             if (!std::filesystem::exists(index_path)) {
                 return crow::response(404, "index.html not found");
             }
@@ -111,16 +112,13 @@ int main() {
             res.set_header("Content-Type", "text/html; charset=utf-8");
             return res;
         });
-
-        // Serve static files
         CROW_ROUTE(app, "/app/<path>")
         ([dist_dir](const crow::request&, std::string file_path) {
-            std::string full_path = dist_dir + "/" + file_path;
+            auto full_path = dist_dir / file_path;
             if (!std::filesystem::exists(full_path)) {
-                // SPA fallback: serve index.html
-                std::string index_path = dist_dir + "/index.html";
-                if (std::filesystem::exists(index_path)) {
-                    std::ifstream ifs(index_path);
+                auto index = dist_dir / "index.html";
+                if (std::filesystem::exists(index)) {
+                    std::ifstream ifs(index);
                     std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
                     crow::response res(content);
                     res.set_header("Content-Type", "text/html; charset=utf-8");
@@ -129,13 +127,8 @@ int main() {
                 return crow::response(404, "File not found");
             }
             std::ifstream ifs(full_path, std::ios::binary);
-            if (!ifs) {
-                return crow::response(500, "Cannot read file");
-            }
             std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
             crow::response res(content);
-
-            // 设置 Content-Type
             auto ext_pos = file_path.rfind('.');
             if (ext_pos != std::string::npos) {
                 std::string ext = file_path.substr(ext_pos + 1);
@@ -154,21 +147,31 @@ int main() {
             res.set_header("Cache-Control", "public, max-age=31536000");
             return res;
         });
-
-        std::cout << "[Static] Frontend available at: http://" << cfg.host << ":" << cfg.port << "/app" << std::endl;
     }
 
-    // Health check
-    CROW_ROUTE(app, "/")([]() {
-        nlohmann::json status = {
-            {"name", "MindVault"},
-            {"version", "1.0.0"},
-            {"status", "running"}
-        };
-        return crow::response(status.dump());
+    // Health check + Server info
+    CROW_ROUTE(app, "/")
+    ([&cfg]() {
+        crow::response res("{\"name\":\"MindVault\",\"status\":\"running\",\"version\":\"1.0.0\"}");
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        return res;
     });
 
-    // Start server
+    // GET /api/server/url - 返回服务器地址
+    CROW_ROUTE(app, "/api/server/url").methods("GET"_method)
+    ([&cfg]() {
+        std::string host_url = "http://localhost:" + std::to_string(cfg.port);
+        // 尝试获取局域网 IP
+#ifdef _WIN32
+        // 通过 icanhazip 或类似服务获取外网 IP 过于复杂
+        // 简单返回 host:port，前端会处理 localhost 替换
+#endif
+        nlohmann::json result = {{"url", host_url}, {"port", cfg.port}};
+        crow::response res(utils::Success(result).dump());
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        return res;
+    });
+
     std::cout << "[Server] Starting on " << cfg.host << ":" << cfg.port << std::endl;
     std::cout << "[Server] API: http://" << cfg.host << ":" << cfg.port << "/api/" << std::endl;
     app.bindaddr(cfg.host).port(cfg.port).multithreaded().run();

@@ -5,146 +5,233 @@
 #include "../services/note_service.h"
 #include "../services/tag_service.h"
 #include "../utils/response.h"
+#include "user_routes.h"
 #include "crow_all.h"
 #include <nlohmann/json.hpp>
 #include <memory>
 
 namespace mindvault::routes {
 
+// 从 token 获取用户 ID
+inline int64_t GetUserIdFromToken(const crow::request& req) {
+    std::string token = req.get_header_value("Authorization");
+    if (token.empty() || token.substr(0, 7) != "Bearer ") return 0;
+    token = token.substr(7);
+    auto pos = token.find('_');
+    if (pos == std::string::npos) return 0;
+    try {
+        return std::stoll(token.substr(0, pos));
+    } catch (...) {
+        return 0;
+    }
+}
+
+// 获取用户数据库
+inline std::shared_ptr<Database> GetUserDb(const crow::request& req) {
+    int64_t user_id = GetUserIdFromToken(req);
+    if (user_id == 0) return nullptr;
+    return UserDbManager::Instance().GetUserDb(user_id);
+}
+
 inline void RegisterNoteRoutes(crow::App<>& app, Database& db) {
-    // Use shared_ptr to ensure services outlive the route registration scope
+    // 默认服务（用于兼容）
     auto note_svc = std::make_shared<services::NoteService>(db);
     auto tag_svc  = std::make_shared<services::TagService>(db);
 
     // GET /api/notes - list notes
     CROW_ROUTE(app, "/api/notes").methods("GET"_method)
-    ([note_svc](const crow::request& req) {
+    ([&db](const crow::request& req) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
+        }
+        services::NoteService svc(*user_db);
         std::string folder = req.url_params.get("folder") ? req.url_params.get("folder") : "";
-        auto list = note_svc->List(folder);
-        return crow::response(utils::Success(list).dump());
+        auto list = svc.List(folder);
+        return utils::JsonResp(utils::Success(list));
     });
 
     // GET /api/notes/:id - get note detail
     CROW_ROUTE(app, "/api/notes/<int>").methods("GET"_method)
-    ([note_svc](int64_t id) {
-        auto note = note_svc->GetById(id);
-        if (note.is_null()) {
-            return crow::response(404, utils::NotFound("Note").dump());
+    ([&db](const crow::request& req, int64_t id) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
         }
-        return crow::response(utils::Success(note).dump());
+        services::NoteService svc(*user_db);
+        auto note = svc.GetById(id);
+        if (note.is_null()) {
+            return utils::JsonResp(utils::NotFound("Note"), 404);
+        }
+        return utils::JsonResp(utils::Success(note));
     });
 
     // POST /api/notes - create note
     CROW_ROUTE(app, "/api/notes").methods("POST"_method)
-    ([note_svc](const crow::request& req) {
+    ([&db](const crow::request& req) {
         try {
+            auto user_db = GetUserDb(req);
+            if (!user_db) {
+                return utils::JsonResp(utils::Error("未登录"), 401);
+            }
+            services::NoteService svc(*user_db);
             auto body = nlohmann::json::parse(req.body);
             std::string title   = body.value("title", std::string("Untitled"));
             std::string content = body.value("content", std::string(""));
             std::string folder  = body.value("folder", std::string("default"));
-            auto note = note_svc->Create(title, content, folder);
-            return crow::response(201, utils::Success(note).dump());
+            auto note = svc.Create(title, content, folder);
+            return utils::JsonResp(utils::Success(note), 201);
         } catch (const std::exception& e) {
-            return crow::response(400, utils::Error(e.what()).dump());
+            return utils::JsonResp(utils::Error(e.what()), 400);
         }
     });
 
     // PUT /api/notes/:id - update note
     CROW_ROUTE(app, "/api/notes/<int>").methods("PUT"_method)
-    ([note_svc](const crow::request& req, int64_t id) {
+    ([&db](const crow::request& req, int64_t id) {
         try {
+            auto user_db = GetUserDb(req);
+            if (!user_db) {
+                return utils::JsonResp(utils::Error("未登录"), 401);
+            }
+            services::NoteService svc(*user_db);
             auto body = nlohmann::json::parse(req.body);
             std::string title   = body.value("title", std::string(""));
             std::string content = body.value("content", std::string(""));
             std::string folder  = body.value("folder", std::string(""));
-            auto note = note_svc->Update(id, title, content, folder);
+            auto note = svc.Update(id, title, content, folder);
             if (note.is_null()) {
-                return crow::response(404, utils::NotFound("Note").dump());
+                return utils::JsonResp(utils::NotFound("Note"), 404);
             }
-            return crow::response(utils::Success(note).dump());
+            return utils::JsonResp(utils::Success(note));
         } catch (const std::exception& e) {
-            return crow::response(400, utils::Error(e.what()).dump());
+            return utils::JsonResp(utils::Error(e.what()), 400);
         }
     });
 
     // DELETE /api/notes/:id - soft delete
     CROW_ROUTE(app, "/api/notes/<int>").methods("DELETE"_method)
-    ([note_svc](int64_t id) {
-        bool ok = note_svc->Delete(id);
-        if (!ok) {
-            return crow::response(404, utils::NotFound("Note").dump());
+    ([&db](const crow::request& req, int64_t id) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
         }
-        return crow::response(utils::Success().dump());
+        services::NoteService svc(*user_db);
+        bool ok = svc.Delete(id);
+        if (!ok) {
+            return utils::JsonResp(utils::NotFound("Note"), 404);
+        }
+        return utils::JsonResp(utils::Success());
     });
 
     // GET /api/notes/trash - list deleted notes
     CROW_ROUTE(app, "/api/notes/trash").methods("GET"_method)
-    ([note_svc]() {
-        auto list = note_svc->ListTrash();
-        return crow::response(utils::Success(list).dump());
+    ([&db](const crow::request& req) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
+        }
+        services::NoteService svc(*user_db);
+        auto list = svc.ListTrash();
+        return utils::JsonResp(utils::Success(list));
     });
 
     // POST /api/notes/:id/restore - restore deleted note
     CROW_ROUTE(app, "/api/notes/<int>/restore").methods("POST"_method)
-    ([note_svc](int64_t id) {
-        auto note = note_svc->Restore(id);
-        if (note.is_null()) {
-            return crow::response(404, utils::NotFound("Note in trash").dump());
+    ([&db](const crow::request& req, int64_t id) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
         }
-        return crow::response(utils::Success(note).dump());
+        services::NoteService svc(*user_db);
+        auto note = svc.Restore(id);
+        if (note.is_null()) {
+            return utils::JsonResp(utils::NotFound("Note in trash"), 404);
+        }
+        return utils::JsonResp(utils::Success(note));
     });
 
     // DELETE /api/notes/:id/permanent - permanent delete
     CROW_ROUTE(app, "/api/notes/<int>/permanent").methods("DELETE"_method)
-    ([note_svc](int64_t id) {
-        bool ok = note_svc->PermanentDelete(id);
-        if (!ok) {
-            return crow::response(404, utils::NotFound("Note in trash").dump());
+    ([&db](const crow::request& req, int64_t id) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
         }
-        return crow::response(utils::Success().dump());
+        services::NoteService svc(*user_db);
+        bool ok = svc.PermanentDelete(id);
+        if (!ok) {
+            return utils::JsonResp(utils::NotFound("Note in trash"), 404);
+        }
+        return utils::JsonResp(utils::Success());
     });
 
     // DELETE /api/notes/trash/empty - empty trash
     CROW_ROUTE(app, "/api/notes/trash/empty").methods("DELETE"_method)
-    ([note_svc]() {
-        int count = note_svc->EmptyTrash();
-        return crow::response(utils::Success(nlohmann::json({{"deleted_count", count}})).dump());
+    ([&db](const crow::request& req) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
+        }
+        services::NoteService svc(*user_db);
+        int count = svc.EmptyTrash();
+        return utils::JsonResp(utils::Success(nlohmann::json({{"deleted_count", count}})));
     });
 
     // GET /api/notes/:id/backlinks - get backlinks
     CROW_ROUTE(app, "/api/notes/<int>/backlinks").methods("GET"_method)
-    ([note_svc](int64_t id) {
-        auto links = note_svc->GetBacklinks(id);
-        return crow::response(utils::Success(links).dump());
+    ([&db](const crow::request& req, int64_t id) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
+        }
+        services::NoteService svc(*user_db);
+        auto links = svc.GetBacklinks(id);
+        return utils::JsonResp(utils::Success(links));
     });
 
     // GET /api/notes/:id/links - get forward links
     CROW_ROUTE(app, "/api/notes/<int>/links").methods("GET"_method)
-    ([note_svc](int64_t id) {
-        auto links = note_svc->GetForwardLinks(id);
-        return crow::response(utils::Success(links).dump());
+    ([&db](const crow::request& req, int64_t id) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
+        }
+        services::NoteService svc(*user_db);
+        auto links = svc.GetForwardLinks(id);
+        return utils::JsonResp(utils::Success(links));
     });
 
     // PUT /api/notes/:id/order - update note sort order
     CROW_ROUTE(app, "/api/notes/<int>/order").methods("PUT"_method)
-    ([note_svc](const crow::request& req, int64_t id) {
+    ([&db](const crow::request& req, int64_t id) {
         try {
+            auto user_db = GetUserDb(req);
+            if (!user_db) {
+                return utils::JsonResp(utils::Error("未登录"), 401);
+            }
+            services::NoteService svc(*user_db);
             auto body = nlohmann::json::parse(req.body);
             int sort_order = body.value("sort_order", 0);
-            bool ok = note_svc->UpdateSortOrder(id, sort_order);
+            bool ok = svc.UpdateSortOrder(id, sort_order);
             if (!ok) {
-                return crow::response(404, utils::NotFound("Note").dump());
+                return utils::JsonResp(utils::NotFound("Note"), 404);
             }
-            return crow::response(utils::Success().dump());
+            return utils::JsonResp(utils::Success());
         } catch (const std::exception& e) {
-            return crow::response(400, utils::Error(e.what()).dump());
+            return utils::JsonResp(utils::Error(e.what()), 400);
         }
     });
 
     // PUT /api/notes/order - batch update sort orders
     CROW_ROUTE(app, "/api/notes/order").methods("PUT"_method)
-    ([note_svc](const crow::request& req) {
+    ([&db](const crow::request& req) {
         try {
+            auto user_db = GetUserDb(req);
+            if (!user_db) {
+                return utils::JsonResp(utils::Error("未登录"), 401);
+            }
+            services::NoteService svc(*user_db);
             auto body = nlohmann::json::parse(req.body);
             auto orders_json = body.value("orders", nlohmann::json::array());
             std::vector<std::pair<int64_t, int>> orders;
@@ -153,77 +240,107 @@ inline void RegisterNoteRoutes(crow::App<>& app, Database& db) {
                 int order = item["order"].get<int>();
                 orders.push_back({id, order});
             }
-            note_svc->BatchUpdateSortOrder(orders);
-            return crow::response(utils::Success().dump());
+            svc.BatchUpdateSortOrder(orders);
+            return utils::JsonResp(utils::Success());
         } catch (const std::exception& e) {
-            return crow::response(400, utils::Error(e.what()).dump());
+            return utils::JsonResp(utils::Error(e.what()), 400);
         }
     });
 
     // GET /api/notes/:id/tags - get note tags
     CROW_ROUTE(app, "/api/notes/<int>/tags").methods("GET"_method)
-    ([tag_svc](int64_t id) {
-        auto tags = tag_svc->GetNoteTags(id);
-        return crow::response(utils::Success(tags).dump());
+    ([&db](const crow::request& req, int64_t id) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
+        }
+        services::TagService svc(*user_db);
+        auto tags = svc.GetNoteTags(id);
+        return utils::JsonResp(utils::Success(tags));
     });
 
     // POST /api/notes/:id/tags - add tag to note
     CROW_ROUTE(app, "/api/notes/<int>/tags").methods("POST"_method)
-    ([tag_svc](const crow::request& req, int64_t id) {
+    ([&db](const crow::request& req, int64_t id) {
         try {
+            auto user_db = GetUserDb(req);
+            if (!user_db) {
+                return utils::JsonResp(utils::Error("未登录"), 401);
+            }
+            services::TagService svc(*user_db);
             auto body = nlohmann::json::parse(req.body);
             std::string name = body.value("name", std::string(""));
             if (name.empty()) {
-                return crow::response(400, utils::Error("Tag name is required").dump());
+                return utils::JsonResp(utils::Error("Tag name is required"), 400);
             }
-            tag_svc->AddTagToNote(id, name);
-            return crow::response(utils::Success().dump());
+            svc.AddTagToNote(id, name);
+            return utils::JsonResp(utils::Success());
         } catch (const std::exception& e) {
-            return crow::response(400, utils::Error(e.what()).dump());
+            return utils::JsonResp(utils::Error(e.what()), 400);
         }
     });
 
     // DELETE /api/notes/:id/tags - remove tag from note
     CROW_ROUTE(app, "/api/notes/<int>/tags").methods("DELETE"_method)
-    ([tag_svc](const crow::request& req, int64_t id) {
+    ([&db](const crow::request& req, int64_t id) {
         try {
+            auto user_db = GetUserDb(req);
+            if (!user_db) {
+                return utils::JsonResp(utils::Error("未登录"), 401);
+            }
+            services::TagService svc(*user_db);
             auto body = nlohmann::json::parse(req.body);
             std::string name = body.value("name", std::string(""));
             if (name.empty()) {
-                return crow::response(400, utils::Error("Tag name is required").dump());
+                return utils::JsonResp(utils::Error("Tag name is required"), 400);
             }
-            bool ok = tag_svc->RemoveTagFromNote(id, name);
+            bool ok = svc.RemoveTagFromNote(id, name);
             if (!ok) {
-                return crow::response(404, utils::Error("Tag not found on note").dump());
+                return utils::JsonResp(utils::Error("Tag not found on note"), 404);
             }
-            return crow::response(utils::Success().dump());
+            return utils::JsonResp(utils::Success());
         } catch (const std::exception& e) {
-            return crow::response(400, utils::Error(e.what()).dump());
+            return utils::JsonResp(utils::Error(e.what()), 400);
         }
     });
 
     // GET /api/tags/:name/notes - get notes by tag name
     CROW_ROUTE(app, "/api/tags/<str>/notes").methods("GET"_method)
-    ([tag_svc](const std::string& tag_name) {
-        auto notes = tag_svc->GetNotesByTag(tag_name);
-        return crow::response(utils::Success(notes).dump());
+    ([&db](const crow::request& req, const std::string& tag_name) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
+        }
+        services::TagService svc(*user_db);
+        auto notes = svc.GetNotesByTag(tag_name);
+        return utils::JsonResp(utils::Success(notes));
     });
 
     // GET /api/notes/:id/versions - get version history
     CROW_ROUTE(app, "/api/notes/<int>/versions").methods("GET"_method)
-    ([note_svc](int64_t id) {
-        auto versions = note_svc->GetVersions(id);
-        return crow::response(utils::Success(versions).dump());
+    ([&db](const crow::request& req, int64_t id) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
+        }
+        services::NoteService svc(*user_db);
+        auto versions = svc.GetVersions(id);
+        return utils::JsonResp(utils::Success(versions));
     });
 
     // GET /api/versions/:id - get version detail
     CROW_ROUTE(app, "/api/versions/<int>").methods("GET"_method)
-    ([note_svc](int64_t id) {
-        auto version = note_svc->GetVersion(id);
-        if (version.is_null()) {
-            return crow::response(404, utils::NotFound("Version").dump());
+    ([&db](const crow::request& req, int64_t id) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
         }
-        return crow::response(utils::Success(version).dump());
+        services::NoteService svc(*user_db);
+        auto version = svc.GetVersion(id);
+        if (version.is_null()) {
+            return utils::JsonResp(utils::NotFound("Version"), 404);
+        }
+        return utils::JsonResp(utils::Success(version));
     });
 }
 
