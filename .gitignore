@@ -32,3 +32,17 @@ logs/
 # Temp files
 *.tmp
 *.cache
+
+# VS / runtime artifacts at repo root
+.vs/
+data/
+uploads/
+output/
+server_error.txt
+server_output.txt
+share_output.txt
+stderr.txt
+test_output.txt
+test_update.txt
+err.txt
+out.txt

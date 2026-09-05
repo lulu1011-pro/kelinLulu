@@ -156,6 +156,46 @@ notes_fts(title, content)  -- 独立存储，通过触发器同步
 | PUT | `/api/notes/:id/order` | 更新笔记排序 `{sort_order}` |
 | PUT | `/api/notes/order` | 批量更新排序 `{orders: [{id, order}]}` |
 
+### 图片
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/upload/image` | multipart 上传图片 |
+| POST | `/api/upload/base64` | base64 上传图片 |
+| GET | `/uploads/:filename` | 访问图片 |
+
+### 闪卡
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/notes/:id/flashcards` | 笔记的闪卡 |
+| POST | `/api/flashcards` | 创建闪卡 `{note_id, front, back}` |
+| PUT | `/api/flashcards/:id` | 更新闪卡 |
+| DELETE | `/api/flashcards/:id` | 删除闪卡 |
+| GET | `/api/flashcards/due` | 待复习闪卡 |
+| POST | `/api/flashcards/:id/review` | 提交复习 `{quality}` |
+
+### 分享
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/share` | 创建分享链接 `{note_id, permission}` |
+| GET | `/api/share/list` | 获取分享列表 |
+| GET | `/api/share/:code` | 访问分享（无需登录） |
+| DELETE | `/api/share/:id` | 删除分享 |
+
+### 协作（新增）
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/notes/:id/join` | 加入笔记编辑 |
+| POST | `/api/notes/:id/leave` | 离开笔记编辑 |
+| GET | `/api/notes/:id/viewers` | 查看在线用户 |
+| POST | `/api/notes/:id/heartbeat` | 心跳（30秒超时） |
+
+### 权限（新增）
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/notes/:id/permissions` | 获取笔记权限 |
+| POST | `/api/notes/:id/permissions` | 添加权限 `{user_id, role}` |
+| DELETE | `/api/notes/:id/permissions` | 删除权限 `{user_id}` |
+
 ### 其他
 | 方法 | 路径 | 说明 |
 |------|------|------|
