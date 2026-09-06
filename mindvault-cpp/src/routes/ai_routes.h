@@ -205,6 +205,69 @@ inline nlohmann::json buildMessages(const nlohmann::json& history, const std::st
     return messages;
 }
 
+// ─── P0-3.1 Query 改写：消解指代，生成独立完整的问题 ───
+// 策略：取最近 2 轮历史 + 当前问题，让模型改写为无指代的独立问题。
+// 历史不足 2 轮时直接返回原问题（无需改写）。
+// 改写失败或 API 不可用时降级返回原问题，不阻塞主流程。
+inline std::string QueryRewrite(Database& db, int64_t convId, const std::string& currentQuestion,
+    const std::string& provider, const std::string& model, const std::string& api_key, const std::string& api_url) {
+    // 1. 取最近 3 轮（6 条）历史
+    auto msgs = db.GetAIMessages(convId, 6);
+
+    // 2. 历史不足 2 轮（4 条），不需要改写
+    if (msgs.size() < 4) return currentQuestion;
+
+    // 3. 构造改写请求的 messages
+    nlohmann::json rewriteMessages = nlohmann::json::array();
+    rewriteMessages.push_back({{"role", "system"}, {"content",
+        "你是一个查询改写助手。根据对话历史，将用户的当前问题改写为一个独立、完整、无指代的问题。"
+        "必须消解所有指代表达（如'它'、'这个'、'那种'、'前者'、'上面提到的'等），"
+        "使改写后的问题脱离上下文也能被正确理解。"
+        "只输出改写后的问题本身，不要解释、不要加引号、不要加序号。"}});
+
+    // 取最近 2 轮（4 条）历史加入上下文
+    size_t start = msgs.size() >= 4 ? msgs.size() - 4 : 0;
+    for (size_t i = start; i < msgs.size(); ++i) {
+        auto& m = msgs[i];
+        rewriteMessages.push_back({{"role", m["role"].get<std::string>()}, {"content", m["content"].get<std::string>()}});
+    }
+
+    // 当前问题
+    rewriteMessages.push_back({{"role", "user"}, {"content", currentQuestion}});
+
+    // 4. 调用 API 改写
+    std::string rewritten = currentQuestion;
+#ifdef _WIN32
+    if (provider != "ollama" && !api_url.empty() && !api_key.empty()) {
+        std::string res = CallOnlineAPIWithMessages(api_url, api_key, model, rewriteMessages);
+        if (!res.empty()) {
+            try {
+                auto r = nlohmann::json::parse(res);
+                if (r.contains("choices") && r["choices"].size() > 0) {
+                    rewritten = r["choices"][0]["message"]["content"].get<std::string>();
+                    // 清理首尾空白、引号、换行
+                    while (!rewritten.empty() && (rewritten.front() == ' ' || rewritten.front() == '\n' || rewritten.front() == '\t' || rewritten.front() == '"' || rewritten.front() == '\'' || rewritten.front() == 0xE3)) {
+                        if (rewritten.front() == 0xE3 && rewritten.size() >= 3) { rewritten.erase(0, 3); continue; }
+                        rewritten.erase(rewritten.begin());
+                    }
+                    while (!rewritten.empty() && (rewritten.back() == ' ' || rewritten.back() == '\n' || rewritten.back() == '\t' || rewritten.back() == '"' || rewritten.back() == '\'')) {
+                        rewritten.pop_back();
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::cout << "[AI] QueryRewrite parse error: " << e.what() << std::endl;
+            }
+        }
+    }
+#endif
+
+    // 5. 降级：改写结果为空则用原问题
+    if (rewritten.empty()) rewritten = currentQuestion;
+
+    std::cout << "[AI] QueryRewrite: '" << currentQuestion << "' -> '" << rewritten << "'" << std::endl;
+    return rewritten;
+}
+
 inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
     auto search_svc = std::make_shared<services::SearchService>(db);
 
@@ -350,11 +413,32 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
                     // 2. 写入用户消息
                     db.AddAIMessage(convId, "user", question, estimateTokens(question));
 
-                    // 3. 读取历史（截断）
-                    auto history = buildHistory(db, convId, systemPrompt, ragContext, question);
+                    // 2.5 P0-3.1 Query 改写：用历史消解指代，生成独立完整的问题
+                    // 改写失败时降级返回原问题，不阻塞主流程
+                    std::string effectiveQuestion = QueryRewrite(db, convId, question, provider, model, api_key, api_url);
 
-                    // 4. 拼装 messages 数组
-                    auto messages = buildMessages(history, systemPrompt, ragContext, question);
+                    // 用改写后的问题重新检索（如果改写结果不同）
+                    if (effectiveQuestion != question) {
+                        results = search_svc->Search(effectiveQuestion, 5);
+                        ragContext.clear();
+                        for (size_t i = 0; i < results.size(); ++i) {
+                            auto& r = results[i];
+                            std::string title = r.value("title", std::string(""));
+                            std::string snippet = r.value("content_highlight", std::string(""));
+                            if (snippet.empty()) snippet = r.value("title_highlight", std::string(""));
+                            size_t pos;
+                            while ((pos = snippet.find(">>>")) != std::string::npos) snippet.replace(pos, 3, "");
+                            while ((pos = snippet.find("<<<")) != std::string::npos) snippet.replace(pos, 3, "");
+                            ragContext += "[来源" + std::to_string(i + 1) + ": " + title + "]\n" + snippet + "\n\n";
+                        }
+                        std::cout << "[AI] Re-searched with rewritten query" << std::endl;
+                    }
+
+                    // 3. 读取历史（截断）—— 用改写后的问题计算 token 预算
+                    auto history = buildHistory(db, convId, systemPrompt, ragContext, effectiveQuestion);
+
+                    // 4. 拼装 messages 数组 —— 用改写后的问题
+                    auto messages = buildMessages(history, systemPrompt, ragContext, effectiveQuestion);
 
                     // 5. 调用模型
 #ifdef _WIN32
