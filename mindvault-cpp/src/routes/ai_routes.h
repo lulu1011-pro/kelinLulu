@@ -441,6 +441,7 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
                     auto messages = buildMessages(history, systemPrompt, ragContext, effectiveQuestion);
 
                     // 5. 调用模型
+                    int completionTokens = 0;  // P0-4: 用于 token 校准（在线 API 返回 usage 时填充）
 #ifdef _WIN32
                     if (provider == "ollama") {
                         nlohmann::json ollama_req = {{"model", model}, {"prompt", systemPrompt + "\n\n" + question}, {"stream", false}};
@@ -464,6 +465,11 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
                                         answer = r["choices"][0]["message"]["content"];
                                     else if (r.contains("error"))
                                         answer = "API 错误: " + r["error"].value("message", "Unknown");
+                                    // P0-4: 提取 usage.completion_tokens 用于校准
+                                    if (r.contains("usage") && r["usage"].contains("completion_tokens")) {
+                                        completionTokens = r["usage"]["completion_tokens"].get<int>();
+                                        std::cout << "[AI] usage: completion_tokens=" << completionTokens << std::endl;
+                                    }
                                 } catch (const std::exception& e) {
                                     answer = "API 返回格式错误: " + res.substr(0, 200);
                                 }
@@ -476,8 +482,16 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
                         answer = "无法获取 AI 回答。请检查 API Key 和网络连接。\n\n以下是 RAG 检索结果：\n\n" + ragContext;
                     }
 
-                    // 6. 写入 assistant 消息
+                    // 6. 写入 assistant 消息（先用字符粗估，后续用 usage 校准）
                     msgId = db.AddAIMessage(convId, "assistant", answer, estimateTokens(answer));
+
+                    // P0-4: 用 API 返回的 completion_tokens 校准（比字符粗估更准确）
+                    // 为什么不用精确 tokenizer：1) 引入额外依赖增加体积 2) 不同模型 tokenizer 不同
+                    // 3) usage 字段是模型侧精确统计，直接用它校准是最可靠的方式
+                    if (completionTokens > 0 && msgId > 0) {
+                        db.UpdateAIMessageTokens(msgId, completionTokens);
+                        std::cout << "[AI] Calibrated assistant message tokens: " << completionTokens << std::endl;
+                    }
 
                     // 7. 更新会话标题（首轮自动截取前 20 字）
                     if (conv.value("title", "") == "新对话" || conv.value("title", "").empty()) {
