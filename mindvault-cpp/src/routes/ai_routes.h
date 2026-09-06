@@ -4,6 +4,8 @@
 #include "../database.h"
 #include "../services/search_service.h"
 #include "../services/ai_action_service.h"
+#include "../services/graph_qa_service.h"
+#include "../services/function_calling_service.h"
 #include "../utils/response.h"
 #include "crow_all.h"
 #include <nlohmann/json.hpp>
@@ -138,6 +140,46 @@ inline std::string CallOnlineAPIWithMessages(const std::string& api_url, const s
         {"temperature", 0.7},
         {"max_tokens", 2000}
     };
+
+    return HttpPost(host, port, path, req.dump(), api_key);
+}
+
+// P2-2 function calling：带 tools 的 AI 调用（tools 为空时等价于普通调用）
+inline std::string CallOnlineAPIWithTools(const std::string& api_url, const std::string& api_key,
+                                           const std::string& model, const nlohmann::json& messages,
+                                           const nlohmann::json& tools) {
+    std::string url = api_url;
+    int port = 443;
+    bool is_https = true;
+
+    if (url.substr(0, 7) == "http://") { url = url.substr(7); is_https = false; port = 80; }
+    else if (url.substr(0, 8) == "https://") { url = url.substr(8); }
+
+    auto slash_pos = url.find('/');
+    std::string host_str = (slash_pos != std::string::npos) ? url.substr(0, slash_pos) : url;
+    std::wstring path = (slash_pos != std::string::npos)
+        ? std::wstring(url.begin() + slash_pos, url.end())
+        : L"/v1/chat/completions";
+
+    auto colon_pos = host_str.find(':');
+    if (colon_pos != std::string::npos) {
+        port = std::stoi(host_str.substr(colon_pos + 1));
+        host_str = host_str.substr(0, colon_pos);
+    } else if (is_https) { port = 443; }
+
+    std::wstring host(host_str.begin(), host_str.end());
+
+    nlohmann::json req = {
+        {"model", model},
+        {"messages", messages},
+        {"temperature", 0.7},
+        {"max_tokens", 2000}
+    };
+    // tools 非空时加入请求体
+    if (!tools.is_null() && !tools.empty()) {
+        req["tools"] = tools;
+        req["tool_choice"] = "auto";
+    }
 
     return HttpPost(host, port, path, req.dump(), api_key);
 }
@@ -1001,6 +1043,69 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
 
             services::AIActionService svc(*user_db, caller);
             auto result = svc.ExecuteAction(action, text, target_lang, note_id, api_url, api_key, model);
+            return crow::response(utils::Success(result).dump());
+        } catch (const std::exception& e) {
+            return crow::response(400, utils::Error(e.what()).dump());
+        }
+    });
+
+    // POST /api/ai/graph-qa - P2-1 知识图谱问答（结构化走SQL，非结构化走LLM）
+    CROW_ROUTE(app, "/api/ai/graph-qa").methods("POST"_method)
+    ([&db](const crow::request& req) {
+        int64_t uid = extractUserId(req);
+        if (uid <= 0) return crow::response(401, utils::Error("未登录").dump());
+        try {
+            auto body = nlohmann::json::parse(req.body);
+            std::string question = body.value("question", std::string(""));
+            int64_t note_id = body.value("note_id", int64_t(0));
+            std::string api_url = body.value("api_url", std::string(""));
+            std::string api_key = body.value("api_key", std::string(""));
+            std::string model = body.value("model", std::string(""));
+
+            if (question.empty()) return crow::response(400, utils::Error("question is required").dump());
+
+            auto user_db = GetUserDb2(req);
+            if (!user_db) return crow::response(500, utils::Error("用户库不存在").dump());
+
+            services::GraphAICaller caller = [](const std::string& url, const std::string& key,
+                                                 const std::string& mdl, const nlohmann::json& msgs) {
+                return CallOnlineAPIWithMessages(url, key, mdl, msgs);
+            };
+
+            services::GraphQAService svc(*user_db, caller);
+            auto result = svc.Answer(question, note_id, api_url, api_key, model);
+            return crow::response(utils::Success(result).dump());
+        } catch (const std::exception& e) {
+            return crow::response(400, utils::Error(e.what()).dump());
+        }
+    });
+
+    // POST /api/ai/chat-with-tools - P2-2 function calling 轻量用法（2个真实只读工具）
+    CROW_ROUTE(app, "/api/ai/chat-with-tools").methods("POST"_method)
+    ([&db](const crow::request& req) {
+        int64_t uid = extractUserId(req);
+        if (uid <= 0) return crow::response(401, utils::Error("未登录").dump());
+        try {
+            auto body = nlohmann::json::parse(req.body);
+            std::string question = body.value("question", std::string(""));
+            std::string api_url = body.value("api_url", std::string(""));
+            std::string api_key = body.value("api_key", std::string(""));
+            std::string model = body.value("model", std::string(""));
+
+            if (question.empty()) return crow::response(400, utils::Error("question is required").dump());
+            if (api_key.empty()) return crow::response(400, utils::Error("请配置 API Key").dump());
+
+            auto user_db = GetUserDb2(req);
+            if (!user_db) return crow::response(500, utils::Error("用户库不存在").dump());
+
+            services::FCAICaller caller = [](const std::string& url, const std::string& key,
+                                              const std::string& mdl, const nlohmann::json& msgs,
+                                              const nlohmann::json& tools) {
+                return CallOnlineAPIWithTools(url, key, mdl, msgs, tools);
+            };
+
+            services::FunctionCallingService svc(*user_db, caller);
+            auto result = svc.ChatWithTools(question, api_url, api_key, model);
             return crow::response(utils::Success(result).dump());
         } catch (const std::exception& e) {
             return crow::response(400, utils::Error(e.what()).dump());
