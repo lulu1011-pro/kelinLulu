@@ -210,6 +210,24 @@ inline void RegisterNoteRoutes(crow::App<>& app, Database& db) {
         return utils::JsonResp(utils::Success(links));
     });
 
+
+    // GET /api/notes/:id/recommendations - P1-7 关联笔记推荐（link_edges 强信号 + 向量弱信号融合）
+    CROW_ROUTE(app, "/api/notes/<int>/recommendations").methods("GET"_method)
+    ([&db](const crow::request& req, int64_t id) {
+        auto user_db = GetUserDb(req);
+        if (!user_db) {
+            return utils::JsonResp(utils::Error("未登录"), 401);
+        }
+        services::NoteService svc(*user_db);
+        // 先确认笔记存在
+        auto note = svc.GetById(id);
+        if (note.is_null()) {
+            return utils::JsonResp(utils::Error("笔记不存在"), 404);
+        }
+        auto recs = svc.GetRecommendations(id);
+        return utils::JsonResp(utils::Success(recs));
+    });
+
     // PUT /api/notes/:id/order - update note sort order
     CROW_ROUTE(app, "/api/notes/<int>/order").methods("PUT"_method)
     ([&db](const crow::request& req, int64_t id) {

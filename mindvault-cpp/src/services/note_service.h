@@ -230,6 +230,119 @@ public:
         )", {note_id});
     }
 
+    // ─── P1-7 关联笔记推荐：link_edges 强信号 + 向量弱信号融合 ───
+    // 强信号（人工双向链接）+2.0，弱信号（向量余弦相似度）0~1.0
+    // 两路都命中的排最前，只有链接的次之，只有向量的再次之
+    nlohmann::json GetRecommendations(int64_t note_id, int limit = 10) {
+        std::unordered_map<int64_t, double> scores;
+        std::unordered_map<int64_t, std::string> titles;
+        std::unordered_map<int64_t, std::string> folders;
+        std::unordered_map<int64_t, bool> is_linked;
+
+        // ── 强信号路：正向 + 反向链接，去重，每个 +2.0 ──
+        auto fwd = GetForwardLinks(note_id);
+        auto bwd = GetBacklinks(note_id);
+        for (auto& n : fwd) {
+            int64_t nid = n.value("id", int64_t(0));
+            if (nid > 0 && nid != note_id) {
+                scores[nid] += 2.0;
+                titles[nid] = n.value("title", std::string(""));
+                is_linked[nid] = true;
+            }
+        }
+        for (auto& n : bwd) {
+            int64_t nid = n.value("id", int64_t(0));
+            if (nid > 0 && nid != note_id) {
+                scores[nid] += 2.0;
+                titles[nid] = n.value("title", std::string(""));
+                is_linked[nid] = true;
+            }
+        }
+
+        // ── 弱信号路：向量余弦相似度 ──
+        try {
+            // 拿当前笔记的 chunk embedding
+            auto my_chunks = db_.GetChunksByNote(note_id);
+            std::vector<std::vector<double>> my_embs;
+            for (auto& c : my_chunks) {
+                std::string emb_str = c.value("embedding_json", std::string(""));
+                if (emb_str.empty()) continue;
+                try {
+                    auto j = nlohmann::json::parse(emb_str);
+                    if (!j.is_array()) continue;
+                    std::vector<double> emb;
+                    for (auto& v : j) emb.push_back(v.get<double>());
+                    if (!emb.empty()) my_embs.push_back(emb);
+                } catch (...) {}
+            }
+
+            if (!my_embs.empty()) {
+                // 拿所有笔记的 chunk（排除当前笔记），算每个笔记的最大相似度
+                auto all_chunks = db_.GetAllChunks();
+                std::unordered_map<int64_t, double> max_sim;
+                for (auto& c : all_chunks) {
+                    int64_t nid = c.value("note_id", int64_t(0));
+                    if (nid <= 0 || nid == note_id) continue;
+                    std::string emb_str = c.value("embedding_json", std::string(""));
+                    if (emb_str.empty()) continue;
+                    std::vector<double> chunk_emb;
+                    try {
+                        auto j = nlohmann::json::parse(emb_str);
+                        if (!j.is_array()) continue;
+                        for (auto& v : j) chunk_emb.push_back(v.get<double>());
+                    } catch (...) { continue; }
+                    if (chunk_emb.empty()) continue;
+
+                    // 和当前笔记所有 chunk 算余弦，取最大值
+                    double best = 0.0;
+                    for (auto& my_emb : my_embs) {
+                        if (chunk_emb.size() != my_emb.size()) continue;
+                        double sim = ChunkService::CosineSimilarity(my_emb, chunk_emb);
+                        if (sim > best) best = sim;
+                    }
+                    if (best > max_sim[nid]) max_sim[nid] = best;
+                    titles[nid] = c.value("title", std::string(""));
+                    folders[nid] = c.value("folder", std::string(""));
+                }
+
+                // 向量相似度加入分数
+                for (auto& [nid, sim] : max_sim) {
+                    scores[nid] += sim;
+                }
+            }
+        } catch (const std::exception& e) {
+            // 向量路失败不影响强信号路结果
+            std::cerr << "[Recommend] vector path failed: " << e.what() << std::endl;
+        }
+
+        // ── 排序 + 输出 ──
+        std::vector<std::pair<double, int64_t>> ranked;
+        for (auto& [nid, score] : scores) {
+            ranked.push_back({score, nid});
+        }
+        std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+            return a.first > b.first;
+        });
+
+        nlohmann::json results = nlohmann::json::array();
+        int count = std::min(limit, (int)ranked.size());
+        for (int i = 0; i < count; ++i) {
+            int64_t nid = ranked[i].second;
+            nlohmann::json item;
+            item["id"] = nid;
+            item["title"] = titles.count(nid) ? titles[nid] : "";
+            item["folder"] = folders.count(nid) ? folders[nid] : "";
+            item["score"] = ranked[i].first;
+            // source: both=链接+向量, linked=只有链接, similar=只有向量
+            bool linked = is_linked.count(nid) && is_linked[nid];
+            if (linked && ranked[i].first > 2.0) item["source"] = "both";
+            else if (linked) item["source"] = "linked";
+            else item["source"] = "similar";
+            results.push_back(item);
+        }
+        return results;
+    }
+
     // ─── 版本历史 ───
 
     // 保存版本
