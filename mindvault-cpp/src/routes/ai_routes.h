@@ -148,6 +148,180 @@ inline std::string CallOnlineAPI(const std::string& api_url, const std::string& 
     };
     return CallOnlineAPIWithMessages(api_url, api_key, model, messages);
 }
+
+// ─── P0-2 SSE 流式输出基础设施 ───
+
+// 流式 POST：逐块读取响应，通过回调返回原始数据
+// onChunk 返回 false 表示客户端请求中止
+inline bool HttpPostStream(const std::wstring& host, int port, const std::wstring& path,
+    const std::string& body, const std::string& auth,
+    std::function<bool(const char* data, size_t len)> onChunk) {
+    HINTERNET hSession = WinHttpOpen(L"MindVault/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
+    if (!hSession) return false;
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), port, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
+
+    DWORD flags = (port == 443) ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path.c_str(),
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    std::wstring headers = L"Content-Type: application/json\r\nAccept: text/event-stream";
+    if (!auth.empty()) {
+        headers += L"\r\nAuthorization: Bearer ";
+        headers += std::wstring(auth.begin(), auth.end());
+    }
+
+    BOOL result = WinHttpSendRequest(hRequest, headers.c_str(), -1,
+        (LPVOID)body.c_str(), (DWORD)body.size(), (DWORD)body.size(), 0);
+    if (!result) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    WinHttpReceiveResponse(hRequest, nullptr);
+
+    bool success = true;
+    DWORD bytesAvailable = 0;
+    do {
+        WinHttpQueryDataAvailable(hRequest, &bytesAvailable);
+        if (bytesAvailable > 0) {
+            std::vector<char> buffer(bytesAvailable);
+            DWORD bytesRead = 0;
+            WinHttpReadData(hRequest, buffer.data(), bytesAvailable, &bytesRead);
+            if (bytesRead > 0) {
+                if (!onChunk(buffer.data(), bytesRead)) {
+                    success = false;  // 客户端中止
+                    break;
+                }
+            }
+        }
+    } while (bytesAvailable > 0);
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return success;
+}
+
+// SSE 解析器：处理 OpenAI 兼容的流式响应（data: {...}\n\n）
+// 维护内部缓冲区，支持逐块喂入
+class SSEParser {
+public:
+    void feed(const char* data, size_t len, std::function<void(const std::string& delta)> onDelta) {
+        buffer_.append(data, len);
+        size_t pos;
+        // SSE 事件以空行（\n\n）分隔
+        while ((pos = buffer_.find("\n\n")) != std::string::npos) {
+            std::string event = buffer_.substr(0, pos);
+            buffer_.erase(0, pos + 2);
+            parseEvent(event, onDelta);
+        }
+    }
+
+    bool done() const { return done_; }
+    int completionTokens() const { return completionTokens_; }
+
+private:
+    std::string buffer_;
+    bool done_ = false;
+    int completionTokens_ = 0;
+
+    void parseEvent(const std::string& event, std::function<void(const std::string& delta)> onDelta) {
+        size_t dataPos = event.find("data: ");
+        if (dataPos == std::string::npos) return;
+        std::string dataStr = event.substr(dataPos + 6);
+        // trim
+        while (!dataStr.empty() && (dataStr.front() == ' ' || dataStr.front() == '\r' || dataStr.front() == '\n'))
+            dataStr.erase(dataStr.begin());
+        while (!dataStr.empty() && (dataStr.back() == ' ' || dataStr.back() == '\r' || dataStr.back() == '\n'))
+            dataStr.pop_back();
+
+        if (dataStr == "[DONE]") { done_ = true; return; }
+
+        try {
+            auto j = nlohmann::json::parse(dataStr);
+            if (j.contains("choices") && j["choices"].size() > 0) {
+                auto& choice = j["choices"][0];
+                // OpenAI 格式：choices[0].delta.content
+                if (choice.contains("delta") && choice["delta"].contains("content")) {
+                    std::string delta = choice["delta"]["content"].get<std::string>();
+                    if (!delta.empty()) onDelta(delta);
+                }
+                // 部分 API 把 usage 放在 choice 里
+                if (choice.contains("usage") && choice["usage"].contains("completion_tokens"))
+                    completionTokens_ = choice["usage"]["completion_tokens"].get<int>();
+            }
+            // usage 可能在顶层
+            if (j.contains("usage") && j["usage"].contains("completion_tokens"))
+                completionTokens_ = j["usage"]["completion_tokens"].get<int>();
+        } catch (...) { /* 忽略解析失败的 chunk */ }
+    }
+};
+
+// 流式调用结果
+struct StreamResult {
+    std::string fullContent;
+    int completionTokens = 0;
+    bool success = false;
+    std::string error;
+};
+
+// 流式调用在线 API：整合 HttpPostStream + SSEParser
+// onDelta: 每收到一个内容增量就调用
+// shouldAbort: 检查是否需要中止（客户端断开时返回 true）
+inline StreamResult CallOnlineAPIStream(
+    const std::string& api_url, const std::string& api_key, const std::string& model,
+    const nlohmann::json& messages,
+    std::function<void(const std::string& delta)> onDelta,
+    std::function<bool()> shouldAbort = []() { return false; }) {
+    StreamResult result;
+
+    // 解析 URL
+    std::string url = api_url;
+    int port = 443;
+    if (url.substr(0, 7) == "http://") { url = url.substr(7); port = 80; }
+    else if (url.substr(0, 8) == "https://") { url = url.substr(8); port = 443; }
+
+    std::wstring whost(url.begin(), url.end());
+    size_t slashPos = whost.find(L'/');
+    std::wstring host = whost.substr(0, slashPos);
+    std::wstring path = (slashPos != std::wstring::npos) ? whost.substr(slashPos) : L"/";
+
+    // 构造流式请求（stream_options.include_usage=true 确保最后一个 chunk 带 usage）
+    nlohmann::json reqBody = {
+        {"model", model},
+        {"messages", messages},
+        {"stream", true},
+        {"stream_options", {{"include_usage", true}}}
+    };
+
+    SSEParser parser;
+    std::string fullContent;
+
+    bool ok = HttpPostStream(host, port, path, reqBody.dump(), api_key,
+        [&](const char* data, size_t len) -> bool {
+            if (shouldAbort()) return false;
+            parser.feed(data, len, [&](const std::string& delta) {
+                fullContent += delta;
+                onDelta(delta);
+            });
+            return !parser.done();
+        });
+
+    result.fullContent = fullContent;
+    result.completionTokens = parser.completionTokens();
+    result.success = ok && !fullContent.empty();
+    if (!result.success && fullContent.empty()) result.error = "Stream returned empty content";
+    return result;
+}
 #endif
 
 // ─── 构建历史消息（含截断）───
