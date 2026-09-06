@@ -31,7 +31,8 @@ inline std::shared_ptr<Database> GetUserDb2(const crow::request& req) {
 }
 
 inline void RegisterSearchRoutes(crow::App<>& app, Database& db) {
-    // GET /api/search?q=keyword - FTS5 full-text search
+    // GET /api/search?q=keyword - P1-5 混合检索（FTS5 + 向量 + RRF）
+    // 可选参数：api_key, api_url, model（为空时降级纯 FTS5）
     CROW_ROUTE(app, "/api/search").methods("GET"_method)
     ([&db](const crow::request& req) {
         auto user_db = GetUserDb2(req);
@@ -44,7 +45,17 @@ inline void RegisterSearchRoutes(crow::App<>& app, Database& db) {
         if (!q || std::string(q).empty()) {
             return crow::response(400, utils::Error("Search query 'q' is required").dump());
         }
-        auto results = svc.Search(q);
+
+        // 可选的 embedding API 配置（前端有配置就传，没有就纯 FTS5）
+        std::string api_key, api_url, model;
+        const char* k = req.url_params.get("api_key");
+        const char* u = req.url_params.get("api_url");
+        const char* m = req.url_params.get("model");
+        if (k) api_key = k;
+        if (u) api_url = u;
+        if (m) model = m;
+
+        auto results = svc.HybridSearch(q, 50, api_url, api_key, model);
         return crow::response(utils::Success(results).dump());
     });
 

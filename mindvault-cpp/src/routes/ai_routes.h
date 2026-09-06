@@ -551,7 +551,7 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
             }
 
             // RAG: 检索相关笔记
-            auto results = search_svc->Search(question, 5);
+            auto results = search_svc->HybridSearch(question, 5, api_url, api_key, model);
 
             // 构建检索上下文
             std::string ragContext;
@@ -595,7 +595,7 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
 
                     // 用改写后的问题重新检索（如果改写结果不同）
                     if (effectiveQuestion != question) {
-                        results = search_svc->Search(effectiveQuestion, 5);
+                        results = search_svc->HybridSearch(effectiveQuestion, 5, api_url, api_key, model);
                         ragContext.clear();
                         for (size_t i = 0; i < results.size(); ++i) {
                             auto& r = results[i];
@@ -783,7 +783,7 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
 
             // RAG 检索
             std::cout << "[AI Stream] Starting RAG search..." << std::endl;
-            auto results = search_svc->Search(question, 5);
+            auto results = search_svc->HybridSearch(question, 5, api_url, api_key, model);
             std::cout << "[AI Stream] RAG search done, results=" << results.size() << std::endl;
             std::string ragContext;
             for (size_t i = 0; i < results.size(); ++i) {
@@ -825,7 +825,7 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
             // 3. P0-3.1 Query 改写
             std::string effectiveQuestion = QueryRewrite(db, convId, question, provider, model, api_key, api_url);
             if (effectiveQuestion != question) {
-                results = search_svc->Search(effectiveQuestion, 5);
+                results = search_svc->HybridSearch(effectiveQuestion, 5, api_url, api_key, model);
                 ragContext.clear();
                 for (size_t i = 0; i < results.size(); ++i) {
                     auto& r = results[i];
