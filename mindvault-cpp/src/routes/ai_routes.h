@@ -589,7 +589,9 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
 
                     // 2.5 P0-3.1 Query 改写：用历史消解指代，生成独立完整的问题
                     // 改写失败时降级返回原问题，不阻塞主流程
-                    std::string effectiveQuestion = QueryRewrite(db, convId, question, provider, model, api_key, api_url);
+                    std::cout << "[AI Stream] Starting QueryRewrite..." << std::endl;
+            std::string effectiveQuestion = QueryRewrite(db, convId, question, provider, model, api_key, api_url);
+            std::cout << "[AI Stream] QueryRewrite done, changed=" << (effectiveQuestion != question) << std::endl;
 
                     // 用改写后的问题重新检索（如果改写结果不同）
                     if (effectiveQuestion != question) {
@@ -750,59 +752,63 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
     // 与 /api/ai/chat 共享会话机制、QueryRewrite、token 预算
     // 前端用 fetch + ReadableStream 逐块渲染（EventSource 不支持 POST）
     CROW_ROUTE(app, "/api/ai/chat/stream").methods("POST"_method)
-    ([&db, &search_svc](const crow::request& req, crow::response& res) {
-        int64_t uid = extractUserId(req);
-        auto body = nlohmann::json::parse(req.body);
-        std::string question = body.value("question", std::string(""));
-        std::string provider = body.value("provider", std::string("ollama"));
-        std::string model = body.value("model", std::string("qwen-turbo"));
-        std::string api_key = body.value("api_key", std::string(""));
-        std::string api_url = body.value("api_url", std::string(""));
-        int64_t convId = body.value("conversation_id", int64_t(0));
-
-        std::cout << "[AI Stream] Request: provider=" << provider << ", model=" << model
-                  << ", convId=" << convId << std::endl;
-
-        if (question.empty()) {
-            res.code = 400;
-            res.write(utils::Error("Question is required").dump());
-            res.end();
-            return;
-        }
-
-        // 流式只支持会话模式（需要写入历史、token 校准）
-        if (convId <= 0 || uid <= 0) {
-            res.code = 400;
-            res.write(utils::Error("流式对话需要 conversation_id").dump());
-            res.end();
-            return;
-        }
-
-        // RAG 检索（先用原问题，QueryRewrite 后可能重新检索）
-        auto results = search_svc->Search(question, 5);
-        std::string ragContext;
-        for (size_t i = 0; i < results.size(); ++i) {
-            auto& r = results[i];
-            std::string title = r.value("title", std::string(""));
-            std::string snippet = r.value("content_highlight", std::string(""));
-            if (snippet.empty()) snippet = r.value("title_highlight", std::string(""));
-            size_t pos;
-            while ((pos = snippet.find(">>>")) != std::string::npos) snippet.replace(pos, 3, "");
-            while ((pos = snippet.find("<<<")) != std::string::npos) snippet.replace(pos, 3, "");
-            ragContext += "[来源" + std::to_string(i + 1) + ": " + title + "]\n" + snippet + "\n\n";
-        }
-
-        std::string systemPrompt = "你是一个知识库助手。请基于参考资料回答问题。如果资料无法回答，请明确说明。";
-        std::string answer;
-        int64_t msgId = 0;
-        int completionTokens = 0;
-        std::atomic<bool> aborted{false};  // 客户端断开标志（catch 块也需要访问）
-
-        std::mutex& mtx = getConvMutex(convId);
-        std::lock_guard<std::mutex> lock(mtx);
-
-        db.Begin();
+    ([search_svc, &db](const crow::request& req, crow::response& res) {
+        std::atomic<bool> aborted{false};
+        bool streamStarted = false;  // 是否已发送 HTTP 响应头
         try {
+            int64_t uid = extractUserId(req);
+            auto body = nlohmann::json::parse(req.body);
+            std::string question = body.value("question", std::string(""));
+            std::string provider = body.value("provider", std::string("ollama"));
+            std::string model = body.value("model", std::string("qwen-turbo"));
+            std::string api_key = body.value("api_key", std::string(""));
+            std::string api_url = body.value("api_url", std::string(""));
+            int64_t convId = body.value("conversation_id", int64_t(0));
+
+            std::cout << "[AI Stream] Request: provider=" << provider << ", model=" << model
+                      << ", convId=" << convId << ", q=" << question.substr(0, 50) << std::endl;
+
+            if (question.empty()) {
+                res.code = 400;
+                res.write(utils::Error("Question is required").dump());
+                res.end();
+                return;
+            }
+            if (convId <= 0 || uid <= 0) {
+                res.code = 400;
+                res.write(utils::Error("流式对话需要 conversation_id").dump());
+                res.end();
+                return;
+            }
+
+            // RAG 检索
+            std::cout << "[AI Stream] Starting RAG search..." << std::endl;
+            auto results = search_svc->Search(question, 5);
+            std::cout << "[AI Stream] RAG search done, results=" << results.size() << std::endl;
+            std::string ragContext;
+            for (size_t i = 0; i < results.size(); ++i) {
+                auto& r = results[i];
+                std::string title = r.value("title", std::string(""));
+                std::string snippet = r.value("content_highlight", std::string(""));
+                if (snippet.empty()) snippet = r.value("title_highlight", std::string(""));
+                size_t pos;
+                while ((pos = snippet.find(">>>")) != std::string::npos) snippet.replace(pos, 3, "");
+                while ((pos = snippet.find("<<<")) != std::string::npos) snippet.replace(pos, 3, "");
+                ragContext += "[来源" + std::to_string(i + 1) + ": " + title + "]\n" + snippet + "\n\n";
+            }
+
+            std::string systemPrompt = "你是一个知识库助手。请基于参考资料回答问题。如果资料无法回答，请明确说明。";
+            std::string answer;
+            int64_t msgId = 0;
+            int completionTokens = 0;
+
+            std::mutex& mtx = getConvMutex(convId);
+            std::lock_guard<std::mutex> lock(mtx);
+
+            std::cout << "[AI Stream] Starting DB transaction..." << std::endl;
+            db.Begin();
+            std::cout << "[AI Stream] DB transaction started" << std::endl;
+
             // 1. 校验归属
             auto conv = db.GetAIConversation(convId, uid);
             if (conv.is_null()) {
@@ -834,25 +840,28 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
             }
 
             // 4. 读取历史（P0-4 token 预算截断）
+            std::cout << "[AI Stream] Building history..." << std::endl;
             auto history = buildHistory(db, convId, systemPrompt, ragContext, effectiveQuestion);
-
-            // 5. 拼装 messages
+            std::cout << "[AI Stream] History built, turns=" << history.size() << std::endl;
             auto messages = buildMessages(history, systemPrompt, ragContext, effectiveQuestion);
 
-            // 6. 建立 SSE 流——关键：不调用 res.end()，手动写 HTTP 头 + 逐块推数据
-            // 客户端断开检测：包装 stream_sink_，写失败时设置 aborted 标志
+            // 5. 建立 SSE 流
+            if (!res.stream_sink_ || !res.stream_close_) {
+                db.Rollback();
+                res.code = 500;
+                res.write(utils::Error("Streaming not supported").dump());
+                res.end();
+                return;
+            }
+
             auto origSink = res.stream_sink_;
             res.stream_sink_ = [&](const std::string& data) {
                 if (aborted.load()) return;
-                try {
-                    origSink(data);
-                } catch (...) {
-                    aborted.store(true);
-                    std::cout << "[AI Stream] Client disconnected (write failed)" << std::endl;
-                }
+                try { origSink(data); }
+                catch (...) { aborted.store(true); std::cout << "[AI Stream] Client disconnected" << std::endl; }
             };
 
-            // 手动写 HTTP 响应头（SSE）
+            // 手动写 HTTP 响应头
             std::string httpHeader =
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/event-stream\r\n"
@@ -861,14 +870,15 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
                 "X-Accel-Buffering: no\r\n"
                 "\r\n";
             res.stream_sink_(httpHeader);
+            streamStarted = true;
+            std::cout << "[AI Stream] HTTP header sent, stream started" << std::endl;
 
-            // 发送初始事件（确认连接建立）
             nlohmann::json startEvt = {{"type", "start"}, {"conversation_id", convId}};
             res.stream_sink_("data: " + startEvt.dump() + "\n\n");
 
-            // 7. 调用流式 API
+            // 6. 调用流式 API
 #ifdef _WIN32
-            if (provider != "ollama" && !api_url.empty() && !api_key.empty()) {
+            if (provider != "ollama" && !api_key.empty()) {
                 if (api_url.empty()) {
                     if (provider == "tongyi") api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
                     else if (provider == "doubao") api_url = "https://ark.cn-beijing.volces.com/api/v3/chat/completions";
@@ -878,13 +888,10 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
                 StreamResult sr = CallOnlineAPIStream(
                     api_url, api_key, model, messages,
                     [&](const std::string& delta) {
-                        // 每收到一个 delta，推一个 SSE 事件
                         nlohmann::json evt = {{"type", "delta"}, {"content", delta}};
                         res.stream_sink_("data: " + evt.dump() + "\n\n");
                     },
-                    [&]() -> bool {
-                        return aborted.load();
-                    }
+                    [&]() -> bool { return aborted.load(); }
                 );
                 answer = sr.fullContent;
                 completionTokens = sr.completionTokens;
@@ -897,51 +904,54 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
                 res.stream_sink_("data: " + errEvt.dump() + "\n\n");
             }
 #else
-            nlohmann::json errEvt = {{"type", "error"}, {"message", "流式输出仅支持 Windows 平台"}};
+            nlohmann::json errEvt = {{"type", "error"}, {"message": "流式输出仅支持 Windows 平台"}};
             res.stream_sink_("data: " + errEvt.dump() + "\n\n");
 #endif
 
-            // 8. 写入 assistant 消息（即使客户端断开也写入，保持会话完整）
+            // 7. 写入 assistant 消息（即使客户端断开也写入）
             if (answer.empty() && !aborted.load()) {
                 answer = "无法获取 AI 回答。请检查 API Key 和网络连接。\n\n以下是 RAG 检索结果：\n\n" + ragContext;
             }
             if (!answer.empty()) {
                 msgId = db.AddAIMessage(convId, "assistant", answer, estimateTokens(answer));
-                // P0-4: 用 completion_tokens 校准
                 if (completionTokens > 0 && msgId > 0) {
                     db.UpdateAIMessageTokens(msgId, completionTokens);
                 }
             }
 
-            // 9. 更新会话标题（首轮）
+            // 8. 更新会话标题（首轮）
             if (conv.value("title", "") == "新对话" || conv.value("title", "").empty()) {
                 std::string newTitle = question.length() > 20 ? question.substr(0, 20) : question;
                 db.UpdateAIConversation(convId, uid, newTitle);
             }
-
-            // 10. 更新 updated_at
             db.Execute("UPDATE ai_conversations SET updated_at = datetime('now','localtime') WHERE id = ?", {convId});
-
             db.Commit();
 
-            // 11. 发送结束事件（如果客户端还连着）
+            // 9. 发送结束事件
             if (!aborted.load()) {
                 nlohmann::json doneEvt = {{"type", "done"}, {"message_id", msgId}, {"tokens", completionTokens}};
                 res.stream_sink_("data: " + doneEvt.dump() + "\n\n");
             }
 
-            // 12. 关闭连接（关键：不调用 res.end()，直接关 socket）
-            res.stream_close_();
+            // 10. 关闭连接
+            if (res.stream_close_) res.stream_close_();
 
         } catch (const std::exception& e) {
-            db.Rollback();
-            std::cout << "[AI Stream] Error: " << e.what() << std::endl;
-            // 尝试发送错误事件
-            if (!aborted.load()) {
+            std::cout << "[AI Stream] Exception: " << e.what() << std::endl;
+            try { db.Rollback(); } catch (...) {}
+            if (streamStarted && !aborted.load() && res.stream_sink_) {
+                // 流已建立：发送 SSE 错误事件
                 try {
                     nlohmann::json errEvt = {{"type", "error"}, {"message", e.what()}};
                     res.stream_sink_("data: " + errEvt.dump() + "\n\n");
-                    res.stream_close_();
+                    if (res.stream_close_) res.stream_close_();
+                } catch (...) {}
+            } else {
+                // 流未建立：用普通 HTTP 500 响应
+                try {
+                    res.code = 500;
+                    res.write(utils::Error(e.what()).dump());
+                    res.end();
                 } catch (...) {}
             }
         }
