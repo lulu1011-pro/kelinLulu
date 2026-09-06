@@ -7675,6 +7675,9 @@ namespace crow
         bool completed_{};
         std::function<void()> complete_request_handler_;
         std::function<bool()> is_alive_helper_;
+        // SSE streaming: direct socket write (bound by connection)
+        std::function<void(const std::string&)> stream_sink_;
+        std::function<void()> stream_close_;
         static_file_info file_info;
     };
 } // namespace crow
@@ -9314,7 +9317,14 @@ namespace crow
                 res.is_alive_helper_ = [self]() -> bool {
                     return self->adaptor_.is_open();
                 };
-                
+                res.stream_sink_ = [self](const std::string& data) {
+                    asio::write(self->adaptor_.socket(), asio::buffer(data));
+                };
+                res.stream_close_ = [self]() {
+                    self->adaptor_.shutdown_write();
+                    self->adaptor_.close();
+                };
+
                 detail::middleware_call_helper<detail::middleware_call_criteria_only_global,
                                                0, decltype(ctx_), decltype(*middlewares_)>({}, *middlewares_, req_, res, ctx_);
 
