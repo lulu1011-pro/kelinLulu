@@ -1,6 +1,6 @@
 # MindVault AI 功能增强设计（面试价值导向 · 纯 API 版）
 
-> 文档版本：v1.3 ｜ 创建日期：2026-09-05 ｜ 状态：已实现（P0-1 多轮会话 / P0-2 SSE 流式 / P0-3.1 Query 改写 / P0-4 Token 预算 / P1-5 混合检索 / P1-6 内容创作 / P1-7 自动标签+关联推荐，实现日期 2026-09-07）
+> 文档版本：v1.4 ｜ 创建日期：2026-09-05 ｜ 状态：已实现（P0-1 多轮会话 / P0-2 SSE 流式 / P0-3.1 Query 改写 / P0-4 Token 预算 / P1-5 混合检索 / P1-6 内容创作 / P1-7 自动标签+关联推荐 / P2 图谱问答+function calling，实现日期 2026-09-07）
 > 前提约束：不使用本地模型（Ollama 不装），全部走 OpenAI 兼容在线 API（通义 / 豆包 / OpenAI / 自定义已支持）。
 > 设计目标：每个功能都要能扛住面试官追问到第 3 层以上，而不是堆砌"我有这个功能"。
 
@@ -636,3 +636,141 @@ score(note_id) = Σ 1 / (60 + rank)
 - 兼容回归：会话创建/列表/聊天/详情全部正常；P1-5搜索正常
 - 前端：vue-tsc零错误；AI面板6按钮+替换/复制+降级warning+错误提示；推荐tab展示source图标+相关度
 - 已知限制：无真实API key无法测JSON解析成功路径和标签选择效果；老笔记无embedding向量路暂无法端到端测（P1-5已知问题）
+
+
+---
+
+## 十六、P2 图谱问答 + function calling 已实现记录（实现日期 2026-09-07）
+
+### 16.1 本批改动文件清单
+
+| 文件 | 改动类型 | 改动内容 |
+|------|----------|----------|
+| `src/services/graph_qa_service.h` | **新增** | 图谱问答服务：关键词正则路由判定（结构化/非结构化，非结构化优先级高）+ 结构化路纯SQL查link_edges（不调AI）+ 非结构化路取关联笔记摘要调LLM + ExtractNoteName从问题中提取笔记名（FTS5匹配） |
+| `src/services/function_calling_service.h` | **新增** | function calling服务：2个真实只读工具（search_notes→SearchService::Search，get_note→NoteService::GetById）+ 单轮tool loop（第一次调AI带tools→执行工具→第二次调AI）+ 三层降级（无tool_calls直接返回/解析失败降级/整体异常降级） |
+| `src/routes/ai_routes.h` | 修改 | 新增 `CallOnlineAPIWithTools`（带tools参数的AI调用）+ `POST /api/ai/graph-qa` + `POST /api/ai/chat-with-tools` 两个端点 |
+| `web/src/api.ts` | 修改 | 新增 `graphQA()`/`chatWithTools()` 函数 + `GraphQAResult`/`ToolCall`/`ChatWithToolsResult` 类型 |
+| `web/src/components/KnowledgeGraph.vue` | 修改 | 图谱弹窗底部新增问答输入框：结构化问题高亮路由标签+返回笔记列表可点击、非结构化问题展示AI回答+引用来源、降级黄色标记 |
+| `web/src/components/AIChatPanel.vue` | 修改 | 新增"🔧 工具模式"开关（默认关闭）+ 工具调用过程展示（工具名/状态✓✗/参数）+ 降级提示 |
+
+**数据库迁移**：零迁移。复用 `link_edges`/`notes`/`notes_fts` 三张现有表，不加新表，老库启动不崩。
+
+### 16.2 新增 API 请求响应示例
+
+#### POST /api/ai/graph-qa（知识图谱问答）
+
+**请求**：
+```json
+{
+  "question": "Python 基础链接到哪些笔记？",
+  "note_id": 1,
+  "api_url": "https://api.openai.com/v1/chat/completions",
+  "api_key": "sk-xxx",
+  "model": "gpt-4o-mini"
+}
+```
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| question | 是 | 自然语言问题 |
+| note_id | 否 | 指定上下文笔记，不传则从问题中提取笔记名FTS5匹配 |
+| api_url/api_key/model | 否 | 结构化路不需要，非结构化路需要 |
+
+**响应（结构化路）**：
+```json
+{
+  "ok": true,
+  "data": {
+    "route": "structured",
+    "direction": "forward",
+    "note_id": 1,
+    "notes": [
+      {"id": 2, "title": "Java 基础", "updated_at": "2026-09-07 12:00:00"},
+      {"id": 3, "title": "C++ 基础", "updated_at": "2026-09-07 12:00:00"}
+    ]
+  }
+}
+```
+
+**响应（非结构化路）**：
+```json
+{
+  "ok": true,
+  "data": {
+    "route": "unstructured",
+    "answer": "Python基础被Java和C++两篇笔记引用，它们都...",
+    "sources": [{"id": 2, "title": "Java 基础"}, {"id": 3, "title": "C++ 基础"}]
+  }
+}
+```
+
+**路由判定规则**：
+- 非结构化关键词（优先级高）：总结/解释/为什么/对比/讲了什么/区别/关系/分析/概括/描述/说明/怎么样/如何/评价 → 走 LLM
+- 结构化关键词：哪些/谁/几个/引用了/被引用/链接/关联/列出/有哪些 → 走 SQL
+- 默认走非结构化（更安全）
+
+#### POST /api/ai/chat-with-tools（function calling）
+
+**请求**：
+```json
+{
+  "question": "帮我找关于 RAG 的笔记",
+  "api_url": "https://api.openai.com/v1/chat/completions",
+  "api_key": "sk-xxx",
+  "model": "gpt-4o-mini"
+}
+```
+
+**响应**：
+```json
+{
+  "ok": true,
+  "data": {
+    "answer": "找到一篇关于RAG的笔记：RAG入门，主要讲了检索增强生成的原理...",
+    "tool_calls": [
+      {
+        "name": "search_notes",
+        "args": "{\"query\": \"RAG\"}",
+        "result": "[{\"id\":5,\"title\":\"RAG入门\",\"snippet\":\"...\"}]",
+        "status": "success"
+      }
+    ],
+    "degraded": false
+  }
+}
+```
+
+**工具定义**（OpenAI 兼容格式）：
+| 工具名 | 对应代码函数 | 功能 | 参数 |
+|--------|-------------|------|------|
+| search_notes | SearchService::Search | 按关键词搜索笔记 | query: string |
+| get_note | NoteService::GetById | 获取笔记完整内容 | note_id: integer |
+
+### 16.3 关键设计决策
+
+| 决策 | 选择 | 原因 |
+|------|------|------|
+| 路由判定用关键词正则，不用AI | 非结构化关键词优先级高，默认走非结构化 | 省一次API调用、延迟更低；误判代价只是多调一次AI |
+| 结构化路不调AI | 纯SQL查link_edges，毫秒级响应 | 结构化问题（"哪些笔记引用了X"）不需要AI，直接查图更快 |
+| function calling只做单轮tool loop | 第一次调AI(带tools)→执行工具→第二次调AI(不带tools) | 多轮tool loop容易死循环，单轮足够展示核心概念 |
+| 工具只做只读 | search_notes + get_note，不做创建/删除 | 写操作风险高，本批定位是"轻量用法"不是Agent |
+| 工具结果截断 | 搜索最多5条每条前200字，笔记内容最多1000字 | 防止第二次AI调用prompt超长 |
+| 三层降级 | 无tool_calls直接返回 / 解析失败降级 / 整体异常降级 | 模型不支持tools时退化为普通问答，不白屏 |
+
+### 16.4 验收测试结果（2026-09-07 自测）
+
+- 功能主链路：结构化路正向查询返回2条关联笔记(route=structured)；反向查询正确返回空+warning；非结构化路假key降级不崩；function calling假key降级不崩
+- 约束1 路由判定：结构化问题→route=structured(纯SQL)，非结构化问题→route=unstructured(调LLM)
+- 约束2 不引图数据库：复用link_edges表，零新表
+- 约束3 真实工具：search_notes→SearchService::Search，get_note→NoteService::GetById
+- 约束4 工具失败处理：ExecuteTool内try/catch，整体异常降级
+- 约束5 零依赖：纯C++17+SQLite+WinHTTP
+- 边界：空question→400；无API key→400；笔记名找不到→warning；未登录→401
+- 兼容回归：老聊天/笔记列表/搜索/推荐全部正常
+- 前端：vue-tsc零错误
+- 发现并修复bug：ExtractNoteName死循环（remove_words含空格导致find总能命中replace无变化），修复后结构化路响应从假死超时降到毫秒级
+- 已知限制：无真实API key无法测非结构化路AI回答质量和function calling工具实际调用效果
+
+### 16.5 面试核心难点
+
+**图谱问答的"结构化 vs 非结构化"分路路由**：用关键词正则做路由判定（非结构化优先级高），结构化路纯SQL查link_edges不调AI（毫秒级），非结构化路把关联笔记摘要作为上下文喂给LLM。实现中遇到ExtractNoteName死循环bug（remove_words列表含空格导致find总能命中、replace无变化），修复后结构化路从假死超时恢复正常。这个设计的面试亮点是"结构化数据走SQL、非结构化走LLM"的分路思想，以及"不用AI做路由、用关键词正则省一次调用"的工程权衡。
