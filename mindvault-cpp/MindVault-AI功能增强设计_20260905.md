@@ -1,6 +1,6 @@
 # MindVault AI 功能增强设计（面试价值导向 · 纯 API 版）
 
-> 文档版本：v1.2 ｜ 创建日期：2026-09-05 ｜ 状态：已实现（P0-1 多轮会话 / P0-2 SSE 流式 / P0-3.1 Query 改写 / P0-4 Token 预算 / P1-5 混合检索，实现日期 2026-09-05）
+> 文档版本：v1.3 ｜ 创建日期：2026-09-05 ｜ 状态：已实现（P0-1 多轮会话 / P0-2 SSE 流式 / P0-3.1 Query 改写 / P0-4 Token 预算 / P1-5 混合检索 / P1-6 内容创作 / P1-7 自动标签+关联推荐，实现日期 2026-09-07）
 > 前提约束：不使用本地模型（Ollama 不装），全部走 OpenAI 兼容在线 API（通义 / 豆包 / OpenAI / 自定义已支持）。
 > 设计目标：每个功能都要能扛住面试官追问到第 3 层以上，而不是堆砌"我有这个功能"。
 
@@ -506,3 +506,133 @@ score(note_id) = Σ 1 / (60 + rank)
 - 兼容回归：P0会话功能全部正常（创建会话/列表/聊天/详情）
 - 前端：零改动，HybridSearch输出格式与Search一致，不会白屏
 - 已知问题：FTS5默认unicode61分词器不识别中文（非本批引入）；老笔记无chunk需手动重建；无真实API key无法端到端测向量路
+
+
+---
+
+## 十五、P1-6 内容创作 + P1-7 自动标签/关联推荐 已实现记录（实现日期 2026-09-07）
+
+### 15.1 本批改动文件清单
+
+| 文件 | 改动类型 | 改动内容 |
+|------|----------|----------|
+| `src/services/ai_action_service.h` | **新增** | ActionPrompt 模板常量表（6个action五要素prompt）+ JSON提取容错（去代码块围栏+截花括号+重试一次+降级纯文本）+ ExecuteAction 统一入口 + AutoTag（只从已有标签集选+建议新标签不入库） |
+| `src/routes/ai_routes.h` | 修改 | 新增 `POST /api/ai/action` 端点（action白名单校验+参数校验+AICaller lambda复用CallOnlineAPIWithMessages+try/catch） |
+| `src/services/note_service.h` | 修改 | 新增 `GetRecommendations(note_id, limit)`：link_edges双向链接强信号(+2.0) + P1-5向量余弦弱信号(0~1.0) 加权融合，向量路try/catch失败不影响强信号路 |
+| `src/routes/note_routes.h` | 修改 | 新增 `GET /api/notes/:id/recommendations` 端点（笔记存在性校验+404） |
+| `web/src/api.ts` | 修改 | 新增 `aiAction()` / `getRecommendations()` 函数 + `AIActionResult`/`Recommendation`/`AIApiConfig` 类型 |
+| `web/src/components/Editor.vue` | 修改 | Markdown工具栏新增"✨ AI"按钮 + AI创作面板（6个action按钮+结果展示+替换原文/复制+降级warning+错误提示+加载状态） |
+| `web/src/components/BacklinksPanel.vue` | 修改 | 新增"推荐"tab（link_edges强信号🔗 + 向量弱信号✨ + 两者🔗✨，相关度百分比展示） |
+
+**数据库迁移**：零迁移。复用 `tags`/`note_tags`/`link_edges`/`note_chunks` 四张现有表，不加新表，老库启动不崩。
+
+### 15.2 新增 API 请求响应示例
+
+#### POST /api/ai/action（内容创作统一接口）
+
+**请求**：
+```json
+{
+  "action": "polish",
+  "text": "这段文字写的不太好需要润色",
+  "api_url": "https://api.openai.com/v1/chat/completions",
+  "api_key": "sk-xxx",
+  "model": "gpt-4o-mini",
+  "target_lang": "en",
+  "note_id": 1
+}
+```
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| action | 是 | polish/expand/summarize/translate/outline/tags |
+| text | 是 | 选中的文本，最大无硬限制（受API max_tokens约束） |
+| api_url/api_key/model | 是 | AI 配置（从前端 localStorage 读取） |
+| target_lang | 否 | 仅 translate 用，默认"英文" |
+| note_id | 否 | 仅 tags 用，写入 note_tags |
+
+**响应（成功）**：
+```json
+{
+  "ok": true,
+  "data": {
+    "action": "polish",
+    "result": "润色后的文本",
+    "degraded": false
+  }
+}
+```
+
+**响应（解析失败降级）**：
+```json
+{
+  "ok": true,
+  "data": {
+    "action": "polish",
+    "result": "模型原始输出文本",
+    "degraded": true,
+    "warning": "模型未返回结构化JSON，已降级为纯文本"
+  }
+}
+```
+
+**响应（action=tags 自动标签）**：
+```json
+{
+  "ok": true,
+  "data": {
+    "action": "tags",
+    "degraded": false,
+    "selected_tags": ["编程", "后端"],
+    "suggested_new_tags": ["RAG"]
+  }
+}
+```
+- `selected_tags`：只保留在 tags 表中存在的标签，已自动写入 note_tags
+- `suggested_new_tags`：AI 建议的新标签，**不入库**，等用户确认后手动添加
+
+#### GET /api/notes/:id/recommendations（关联笔记推荐）
+
+**请求**：`GET /api/notes/1/recommendations`
+
+**响应**：
+```json
+{
+  "ok": true,
+  "data": [
+    {"id": 2, "title": "Java 基础", "folder": "default", "score": 2.8, "source": "both"},
+    {"id": 3, "title": "C++ 基础", "folder": "default", "score": 2.0, "source": "linked"},
+    {"id": 5, "title": "编程语言对比", "folder": "default", "score": 0.85, "source": "similar"}
+  ]
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| score | 融合分数 = (link_edges命中?2.0:0) + 向量余弦相似度(0~1.0) |
+| source | both=链接+向量都命中 / linked=只有链接 / similar=只有向量 |
+
+### 15.3 关键设计决策
+
+| 决策 | 选择 | 原因 |
+|------|------|------|
+| action 接口统一 | 一个 POST /api/ai/action 覆盖6种操作 | 前端一个函数调所有action，不用为每个action写端点 |
+| JSON 容错策略 | 去围栏→截花括号→重试一次→降级纯文本 | 模型不保证严格JSON，必须容错否则前端崩 |
+| 短上下文无历史 | messages只有system+user两条 | 内容创作是独立操作，带历史会被之前对话带偏；省token响应快 |
+| 自动标签过滤 | selected_tags用std::find只保留已有标签 | 不许AI发明新标签，否则标签体系爆炸 |
+| 建议新标签不入库 | suggested_new_tags原样返回 | 等用户确认，避免污染标签体系 |
+| 推荐融合算法 | score=(linked?2.0:0)+similarity | link_edges是人工确认的强关联(+2.0)，向量是算法推测的弱关联(0~1.0)，强信号权重远大于弱信号 |
+| 向量路降级 | try/catch包裹，失败不影响强信号路 | 老笔记无embedding时推荐退化为纯link_edges，不报错不白屏 |
+
+### 15.4 验收测试结果（2026-09-07 自测）
+
+- 功能主链路：更新笔记建link_edges → 推荐返回2条强信号笔记(score=2.0, source=linked)；action接口假key降级不崩
+- 约束1 JSON容错：假key返回degraded:true+warning，接口不崩
+- 约束2 短上下文：代码审查messages只有system+user两条，无历史
+- 约束3 标签过滤：代码审查std::find过滤只保留已有标签，建议标签不入库
+- 约束4 推荐融合：score=2.0强信号排最前，代码公式加权正确
+- 约束5 不加新表：零CREATE TABLE，零迁移
+- 边界：空action/text→400；超长50000字符→200降级不崩；异常id→404；重复3次→全部200
+- 兼容回归：会话创建/列表/聊天/详情全部正常；P1-5搜索正常
+- 前端：vue-tsc零错误；AI面板6按钮+替换/复制+降级warning+错误提示；推荐tab展示source图标+相关度
+- 已知限制：无真实API key无法测JSON解析成功路径和标签选择效果；老笔记无embedding向量路暂无法端到端测（P1-5已知问题）

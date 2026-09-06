@@ -28,8 +28,10 @@ users、notes、tags、note_tags、link_edges、versions、flashcards、permissi
 - AI 增强 P0-3.1「Query 改写/指代消解」已完成(2026-09-06):新增 QueryRewrite 函数(取最近 2 轮历史 + 当前问题,调用模型改写为无指代独立问题,失败降级返回原问题);已接入 /api/ai/chat 和 /api/ai/chat/stream 端点,改写后重新检索。验证场景:先问「什么是 RAG」→「它和微调有什么区别」→「那我项目里现在用的是哪种」,第三句可正确消解指代。
 - AI 增强 P0-4「Token 预算」已完成(2026-09-06):buildHistory 已做从最老开始丢的 token 预算截断(系统提示词和当前问题永远保留);新增 usage 字段校准(API 返回 completion_tokens 后调用 UpdateAIMessageTokens 校准 assistant 消息 tokens);估算用字符粗估(length/3+1),再用 API usage 校准。不用精确 tokenizer 的原因:1)引入额外依赖增加体积 2)不同模型 tokenizer 不同 3)usage 字段是模型侧精确统计。
 - AI 增强 P1-5「混合检索(FTS5+向量+RRF)」已完成(2026-09-07):新增 note_chunks 表(切块+embedding_json,CREATE TABLE IF NOT EXISTS 幂等不影响老库);新增 chunk_service.h(切块规则:标题→段落→800字符窗口+50字重叠+句子边界对齐;EmbedText 复用 WinHTTP 3秒超时;余弦相似度内存计算;VectorSearch);SearchService 新增 HybridSearch(FTS5路+向量路+RRF融合 k=60,embedding失败降级纯FTS5+日志,输出格式与Search完全一致);/api/search 和 AI对话RAG检索接入 HybridSearch;笔记保存后自动 RebuildChunksForNote(try/catch包裹,失败不影响保存);搜索query加2000字符长度限制(防超长URL连接重置)。前端零改动。已知问题:FTS5默认unicode61分词器不识别中文(非本批引入);老笔记无chunk需手动重建。
+- AI 增强 P1-6「内容创作套件」已完成(2026-09-07):新增 ai_action_service.h(ActionPrompt模板常量表6个action+JSON提取容错去代码块围栏/截花括号/重试一次/降级纯文本+ExecuteAction统一入口);新增 POST /api/ai/action 端点(polish/expand/summarize/translate/outline/tags,短上下文无历史);前端 Editor.vue 新增AI创作面板(6按钮+结果展示+替换原文/复制+降级warning+错误提示)。
+- AI 增强 P1-7「自动标签+关联推荐」已完成(2026-09-07):AutoTag 只从已有标签集选(std::find过滤),建议新标签单独字段不入库;NoteService 新增 GetRecommendations(link_edges双向链接强信号+2.0与P1-5向量余弦弱信号0~1.0加权融合,向量路try/catch失败不影响强信号路);新增 GET /api/notes/:id/recommendations 端点;前端 BacklinksPanel.vue 新增推荐tab(source图标+相关度百分比)。零新表零迁移,复用tags/note_tags/link_edges/note_chunks。
 - P0-3.2 引用溯源为半成品:后端响应已带 sources 字段(ai_routes.h 约 456 行),前端 AIChatPanel.vue 尚未展示来源,待补可点击来源。
-- 详细方案看 P0-1_DESIGN.md(已实现);P0/P1/P2 全量规划看 MindVault-AI功能增强设计_20260905.md(已更新为已实现状态,含第十三章P0批次+第十四章P1-5已实现记录+API请求响应示例)。改 AI 功能时保持 /api/ai/chat 单轮调用兼容。新增端点 POST /api/ai/chat/stream(SSE流式)。
+- 详细方案看 P0-1_DESIGN.md(已实现);P0/P1/P2 全量规划看 MindVault-AI功能增强设计_20260905.md(已更新为已实现状态,含第十三章P0批次+第十四章P1-5+第十五章P1-6/P1-7已实现记录+API请求响应示例)。改 AI 功能时保持 /api/ai/chat 单轮调用兼容。新增端点 POST /api/ai/chat/stream(SSE流式)、POST /api/ai/action(内容创作统一接口)、GET /api/notes/:id/recommendations(关联推荐)。
 
 ## 硬性约定(踩过的坑)
 1. 中文路径:SQLite 打开必须 sqlite3_open16(UTF-16 宽字符),ANSI 版打不开中文路径
