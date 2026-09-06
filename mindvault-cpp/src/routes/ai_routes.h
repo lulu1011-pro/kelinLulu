@@ -3,6 +3,7 @@
 
 #include "../database.h"
 #include "../services/search_service.h"
+#include "../services/ai_action_service.h"
 #include "../utils/response.h"
 #include "crow_all.h"
 #include <nlohmann/json.hpp>
@@ -954,6 +955,55 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
                     res.end();
                 } catch (...) {}
             }
+        }
+    });
+
+    // ──────────────────────────────────────────────
+    // P1-6 内容创作套件 + P1-7 自动标签：统一 action 接口
+    // ──────────────────────────────────────────────
+
+    // POST /api/ai/action - 润色/扩写/总结/翻译/大纲/自动标签
+    CROW_ROUTE(app, "/api/ai/action").methods("POST"_method)
+    ([&db](const crow::request& req) {
+        int64_t uid = extractUserId(req);
+        if (uid <= 0) return crow::response(401, utils::Error("未登录").dump());
+        try {
+            auto body = nlohmann::json::parse(req.body);
+            std::string action = body.value("action", std::string(""));
+            std::string text = body.value("text", std::string(""));
+            std::string target_lang = body.value("target_lang", std::string(""));
+            int64_t note_id = body.value("note_id", int64_t(0));
+            std::string api_url = body.value("api_url", std::string(""));
+            std::string api_key = body.value("api_key", std::string(""));
+            std::string model = body.value("model", std::string(""));
+
+            if (action.empty()) return crow::response(400, utils::Error("action is required").dump());
+            if (text.empty()) return crow::response(400, utils::Error("text is required").dump());
+
+            // 合法 action 白名单
+            static const std::vector<std::string> valid_actions = {"polish", "expand", "summarize", "translate", "outline", "tags"};
+            if (std::find(valid_actions.begin(), valid_actions.end(), action) == valid_actions.end()) {
+                return crow::response(400, utils::Error("unsupported action: " + action).dump());
+            }
+
+            if (api_key.empty()) {
+                return crow::response(400, utils::Error("请配置 API Key").dump());
+            }
+
+            auto user_db = GetUserDb2(req);
+            if (!user_db) return crow::response(500, utils::Error("用户库不存在").dump());
+
+            // 构造 AICaller（复用 CallOnlineAPIWithMessages）
+            services::AICaller caller = [](const std::string& url, const std::string& key,
+                                             const std::string& mdl, const nlohmann::json& msgs) {
+                return CallOnlineAPIWithMessages(url, key, mdl, msgs);
+            };
+
+            services::AIActionService svc(*user_db, caller);
+            auto result = svc.ExecuteAction(action, text, target_lang, note_id, api_url, api_key, model);
+            return crow::response(utils::Success(result).dump());
+        } catch (const std::exception& e) {
+            return crow::response(400, utils::Error(e.what()).dump());
         }
     });
 
