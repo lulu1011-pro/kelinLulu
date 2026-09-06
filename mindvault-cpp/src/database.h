@@ -64,6 +64,7 @@ public:
     // ─── AI 消息操作 ───
     int64_t AddAIMessage(int64_t conversation_id, const std::string& role, const std::string& content, int tokens = 0);
     nlohmann::json GetAIMessages(int64_t conversation_id, int limit = 50);
+    void UpdateAIMessageTokens(int64_t message_id, int tokens);
 
 private:
     sqlite3* db_ = nullptr;
