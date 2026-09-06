@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, nextTick } from 'vue'
-import { conversationsApi, type Conversation, type ChatMessage } from '../api'
+import { conversationsApi, chatStream, type Conversation, type ChatMessage } from '../api'
 
 interface Provider {
   id: string
@@ -22,6 +22,9 @@ const conversations = ref<Conversation[]>([])
 const activeConversationId = ref<number | null>(null)
 const messages = ref<ChatMessage[]>([])
 const loading = ref(false)
+const isStreaming = ref(false)
+const streamError = ref('')
+let abortController: AbortController | null = null
 const showSettings = ref(false)
 const editingTitle = ref<number | null>(null)
 const editTitleValue = ref('')
@@ -178,11 +181,16 @@ async function finishRename() {
 }
 
 // ─── 发送消息 ───
+// 记录最后一次发送的问题，用于重试
+let lastQuestion = ''
+
 async function sendMessage() {
-  if (!input.value.trim() || loading.value) return
+  if (!input.value.trim() || loading.value || isStreaming.value) return
 
   const question = input.value.trim()
   input.value = ''
+  lastQuestion = question
+  streamError.value = ''
 
   // 如果没有会话，先创建一个
   if (!activeConversationId.value) {
@@ -207,70 +215,95 @@ async function sendMessage() {
     created_at: new Date().toISOString(),
   }
   messages.value.push(userMsg)
+
+  // 创建 assistant 占位消息（流式填充内容）
+  const assistantMsgId = Date.now() + 1
+  const assistantMsg: ChatMessage = {
+    id: assistantMsgId,
+    role: 'assistant',
+    content: '',
+    tokens: 0,
+    created_at: new Date().toISOString(),
+  }
+  messages.value.push(assistantMsg)
   await nextTick()
   scrollToBottom()
 
   loading.value = true
+  isStreaming.value = true
+  abortController = new AbortController()
+
   try {
-    const res = await fetch('/api/ai/chat', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${localStorage.getItem('token') || ''}`,
-      },
-      body: JSON.stringify({
+    await chatStream(
+      {
         question,
         provider: selectedProvider.value,
         model: selectedModel.value,
         api_key: apiKey.value,
         api_url: selectedProvider.value === 'custom' ? customUrl.value : '',
         conversation_id: activeConversationId.value,
-      }),
-    })
-    const data = await res.json()
-    if (data.ok) {
-      const assistantMsg: ChatMessage = {
-        id: data.data.message_id || Date.now(),
-        role: 'assistant',
-        content: data.data.answer,
-        tokens: 0,
-        created_at: new Date().toISOString(),
-      }
-      messages.value.push(assistantMsg)
+      },
+      {
+        onDelta: (delta: string) => {
+          assistantMsg.content += delta
+          scrollToBottom()
+        },
+        onDone: (messageId: number, tokens: number) => {
+          if (messageId > 0) assistantMsg.id = messageId
+          if (tokens > 0) assistantMsg.tokens = tokens
+        },
+        onError: (error: string) => {
+          streamError.value = error
+          console.error('Stream error:', error)
+        },
+      },
+      abortController.signal
+    )
 
-      // 更新会话标题（首轮）
-      const conv = conversations.value.find(c => c.id === activeConversationId.value)
-      if (conv && (conv.title === '新对话' || !conv.title)) {
-        conv.title = question.length > 20 ? question.substring(0, 20) : question
-      }
-      // 刷新列表排序
-      await loadConversations()
-      await nextTick()
-      scrollToBottom()
-    } else {
-      // API 返回错误，移除乐观更新的用户消息，显示错误
-      messages.value = messages.value.filter(m => m.id !== userMsgId)
-      messages.value.push({
-        id: Date.now(),
-        role: 'assistant',
-        content: data.error?.message || '请求失败',
-        tokens: 0,
-        created_at: new Date().toISOString(),
-      })
+    // 如果有错误且内容为空，标记为错误消息
+    if (streamError.value && !assistantMsg.content) {
+      assistantMsg.content = '⚠️ ' + streamError.value
     }
+
+    // 更新会话标题（首轮）
+    const conv = conversations.value.find(c => c.id === activeConversationId.value)
+    if (conv && (conv.title === '新对话' || !conv.title)) {
+      conv.title = question.length > 20 ? question.substring(0, 20) : question
+    }
+    await loadConversations()
+    await nextTick()
+    scrollToBottom()
   } catch (e) {
     console.error('AI chat failed:', e)
-    // 网络错误，移除乐观更新的用户消息，显示错误
-    messages.value = messages.value.filter(m => m.id !== userMsgId)
-    messages.value.push({
-      id: Date.now(),
-      role: 'assistant',
-      content: '请求失败，请检查后端服务。',
-      tokens: 0,
-      created_at: new Date().toISOString(),
-    })
+    streamError.value = '请求失败，请检查后端服务。'
+    if (!assistantMsg.content) {
+      assistantMsg.content = '⚠️ 请求失败，请检查后端服务。'
+    }
   } finally {
     loading.value = false
+    isStreaming.value = false
+    abortController = null
+  }
+}
+
+// 取消当前流式请求
+function cancelStream() {
+  if (abortController) {
+    abortController.abort()
+    streamError.value = '已取消'
+  }
+}
+
+// 重试最后一条消息
+function retryLast() {
+  // 移除最后一条 assistant 消息（可能是错误或不完整的）
+  if (messages.value.length > 0 && messages.value[messages.value.length - 1].role === 'assistant') {
+    messages.value.pop()
+  }
+  streamError.value = ''
+  if (lastQuestion) {
+    input.value = lastQuestion
+    sendMessage()
   }
 }
 
@@ -388,12 +421,20 @@ function relativeTime(dateStr: string): string {
                     class="ai-message"
                     :class="msg.role"
                   >
-                    <div class="msg-content">{{ msg.content }}</div>
+                    <div class="msg-content">
+                      {{ msg.content }}<span v-if="isStreaming && msg.role === 'assistant' && messages.length > 0 && msg.id === messages[messages.length - 1].id" class="stream-cursor"></span>
+                    </div>
                     <div class="msg-time">{{ relativeTime(msg.created_at) }}</div>
                   </div>
-                  <div v-if="loading" class="ai-message assistant loading">
+                  <div v-if="loading && !isStreaming" class="ai-message assistant loading">
                     <div class="msg-content">思考中...</div>
                   </div>
+                </div>
+
+                <!-- 错误提示 + 重试 -->
+                <div v-if="streamError" class="stream-error-bar">
+                  <span class="stream-error-text">⚠️ {{ streamError }}</span>
+                  <button class="btn-retry" @click="retryLast">重试</button>
                 </div>
 
                 <!-- 输入区 -->
@@ -406,7 +447,10 @@ function relativeTime(dateStr: string): string {
                     rows="2"
                     @keydown="onKeydown"
                   />
-                  <button class="btn-send" @click="sendMessage" :disabled="!input.trim() || loading">
+                  <button v-if="isStreaming" class="btn-cancel" @click="cancelStream">
+                    取消
+                  </button>
+                  <button v-else class="btn-send" @click="sendMessage" :disabled="!input.trim() || loading">
                     发送
                   </button>
                 </div>
@@ -815,4 +859,52 @@ function relativeTime(dateStr: string): string {
   transform: scale(0.95);
   opacity: 0;
 }
+.stream-cursor {
+  display: inline-block;
+  width: 8px;
+  height: 16px;
+  background: var(--accent, #4a90d9);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink 1s step-end infinite;
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.stream-error-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: rgba(220, 53, 69, 0.1);
+  border: 1px solid rgba(220, 53, 69, 0.3);
+  border-radius: var(--radius, 6px);
+  margin-bottom: 8px;
+}
+.stream-error-text {
+  color: #dc3545;
+  font-size: 13px;
+}
+.btn-retry {
+  padding: 4px 12px;
+  background: #dc3545;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.btn-retry:hover { background: #c82333; }
+.btn-cancel {
+  padding: 8px 16px;
+  background: #6c757d;
+  color: white;
+  border: none;
+  border-radius: var(--radius, 6px);
+  cursor: pointer;
+  font-size: 14px;
+  white-space: nowrap;
+}
+.btn-cancel:hover { background: #5a6268; }
 </style>
