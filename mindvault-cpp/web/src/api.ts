@@ -445,3 +445,56 @@ export const drawingsApi = {
       body: JSON.stringify({ note_id: noteId, image_data: imageData }),
     }),
 }
+
+
+// ─── P1-6 内容创作 + P1-7 自动标签/推荐 ───
+
+export interface AIActionResult {
+  action: string
+  result?: string
+  degraded: boolean
+  warning?: string
+  selected_tags?: string[]
+  suggested_new_tags?: string[]
+}
+
+export interface Recommendation {
+  id: number
+  title: string
+  folder: string
+  score: number
+  source: 'linked' | 'similar' | 'both'
+}
+
+export interface AIApiConfig {
+  api_url: string
+  api_key: string
+  model: string
+}
+
+// 内容创作统一 action 接口：polish|expand|summarize|translate|outline|tags
+export async function aiAction(
+  action: string,
+  text: string,
+  config: AIApiConfig,
+  opts?: { target_lang?: string; note_id?: number }
+): Promise<AIActionResult> {
+  const body: Record<string, unknown> = {
+    action,
+    text,
+    api_url: config.api_url,
+    api_key: config.api_key,
+    model: config.model,
+  }
+  if (opts?.target_lang) body.target_lang = opts.target_lang
+  if (opts?.note_id) body.note_id = opts.note_id
+  return request<AIActionResult>('/ai/action', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+// 关联笔记推荐：link_edges 强信号 + 向量弱信号融合
+export async function getRecommendations(noteId: number): Promise<Recommendation[]> {
+  return request<Recommendation[]>(/notes//recommendations)
+}

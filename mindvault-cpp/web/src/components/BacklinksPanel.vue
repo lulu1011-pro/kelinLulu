@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { notesApi, type Note } from '../api'
+import { notesApi, getRecommendations, type Note, type Recommendation } from '../api'
 
 const props = defineProps<{ noteId: number }>()
 const emit = defineEmits<{ navigate: [note: Note] }>()
@@ -8,22 +8,28 @@ const emit = defineEmits<{ navigate: [note: Note] }>()
 const backlinks = ref<Note[]>([])
 const forwardLinks = ref<Note[]>([])
 const loading = ref(false)
-const activeTab = ref<'back' | 'forward'>('back')
+const activeTab = ref<'back' | 'forward' | 'rec'>('back')
+const recommendations = ref<Recommendation[]>([])
+const recLoading = ref(false)
 
 async function loadLinks() {
   if (!props.noteId) return
   loading.value = true
+  recLoading.value = true
   try {
-    const [bl, fl] = await Promise.all([
+    const [bl, fl, rec] = await Promise.all([
       notesApi.backlinks(props.noteId),
       notesApi.links(props.noteId),
+      getRecommendations(props.noteId).catch(() => []),
     ])
     backlinks.value = bl
     forwardLinks.value = fl
+    recommendations.value = rec
   } catch (e) {
     console.error('Failed to load links:', e)
   } finally {
     loading.value = false
+    recLoading.value = false
   }
 }
 
@@ -45,6 +51,12 @@ watch(() => props.noteId, loadLinks, { immediate: true })
           @click="activeTab = 'forward'"
         >
           ↗ 正向链接 <span v-if="forwardLinks.length" class="count">{{ forwardLinks.length }}</span>
+        </button>
+        <button
+          :class="['tab-btn', { active: activeTab === 'rec' }]"
+          @click="activeTab = 'rec'"
+        >
+          ✨ 推荐 <span v-if="recommendations.length" class="count">{{ recommendations.length }}</span>
         </button>
       </div>
     </div>
@@ -87,6 +99,31 @@ watch(() => props.noteId, loadLinks, { immediate: true })
         <div class="link-info">
           <div class="link-title">{{ link.title }}</div>
           <div class="link-meta">{{ link.updated_at }}</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── P1-7 关联推荐 ─── -->
+    <div v-else-if="activeTab === 'rec'" class="link-list">
+      <div v-if="recLoading" class="panel-loading">加载中...</div>
+      <div v-else-if="recommendations.length === 0" class="empty-links">
+        <span class="empty-icon">✨</span>
+        <p>暂无推荐</p>
+        <p class="hint">添加更多笔记或配置 embedding 后会有推荐</p>
+      </div>
+      <div
+        v-for="rec in recommendations"
+        :key="rec.id"
+        class="link-item"
+        @click="emit('navigate', { id: rec.id, title: rec.title, folder: rec.folder } as Note)"
+      >
+        <span class="link-icon">{{ rec.source === 'both' ? '🔗✨' : rec.source === 'linked' ? '🔗' : '✨' }}</span>
+        <div class="link-info">
+          <div class="link-title">{{ rec.title }}</div>
+          <div class="link-meta">
+            {{ rec.source === 'both' ? '链接+相似' : rec.source === 'linked' ? '已链接' : '内容相似' }}
+            · 相关度 {{ (rec.score * 100).toFixed(0) }}%
+          </div>
         </div>
       </div>
     </div>

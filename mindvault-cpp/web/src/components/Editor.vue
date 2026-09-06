@@ -6,7 +6,7 @@ import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirro
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { oneDark } from '@codemirror/theme-one-dark'
 import { searchKeymap } from '@codemirror/search'
-import { type Note, tagsApi, filesApi, collabApi } from '../api'
+import { type Note, tagsApi, filesApi, collabApi, aiAction, type AIActionResult } from '../api'
 import { marked } from 'marked'
 import TurndownService from 'turndown'
 import mammoth from 'mammoth'
@@ -92,6 +92,86 @@ const previewHtml = ref('')
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 const editorContainer = ref<HTMLDivElement>()
 const previewRef = ref<HTMLDivElement>()
+
+// ─── P1-6 AI 内容创作 ───
+const showAIPanel = ref(false)
+const aiLoading = ref(false)
+const aiResult = ref<AIActionResult | null>(null)
+const aiError = ref('')
+const aiActions = [
+  { key: 'polish', label: '润色', icon: '✨' },
+  { key: 'expand', label: '扩写', icon: '📝' },
+  { key: 'summarize', label: '总结', icon: '📋' },
+  { key: 'translate', label: '翻译', icon: '🌐' },
+  { key: 'outline', label: '大纲', icon: '📑' },
+  { key: 'tags', label: '标签', icon: '🏷️' },
+]
+
+function getSelectedText(): string {
+  const view = editorView.value
+  if (!view) return ''
+  const { from, to } = view.state.selection.main
+  if (from === to) return ''
+  return view.state.doc.sliceString(from, to)
+}
+
+function getAIConfig() {
+  const provider = localStorage.getItem('ai-provider') || 'tongyi'
+  const configStr = localStorage.getItem(`ai-config-${provider}`)
+  let apiKey = '', apiUrl = '', model = ''
+  if (configStr) {
+    try {
+      const cfg = JSON.parse(configStr)
+      apiKey = cfg.key || ''
+      apiUrl = cfg.url || ''
+      model = cfg.model || ''
+    } catch (e) {}
+  }
+  if (!model) model = localStorage.getItem('ai-model') || 'qwen-turbo'
+  return { api_url: apiUrl, api_key: apiKey, model }
+}
+
+async function runAIAction(action: string) {
+  const text = getSelectedText()
+  if (!text) {
+    aiError.value = '请先选中一段文字'
+    return
+  }
+  const config = getAIConfig()
+  if (!config.api_key) {
+    aiError.value = '请先在设置中配置 API Key'
+    return
+  }
+  aiLoading.value = true
+  aiError.value = ''
+  aiResult.value = null
+  try {
+    const opts: { target_lang?: string; note_id?: number } = {}
+    if (action === 'translate') opts.target_lang = '英文'
+    if (action === 'tags') opts.note_id = props.note.id
+    aiResult.value = await aiAction(action, text, config, opts)
+  } catch (e: any) {
+    aiError.value = e.message || 'AI 调用失败'
+  } finally {
+    aiLoading.value = false
+  }
+}
+
+function replaceWithResult() {
+  const view = editorView.value
+  if (!view || !aiResult.value?.result) return
+  const { from, to } = view.state.selection.main
+  view.dispatch({ changes: { from, to, insert: aiResult.value.result } })
+  noteContent.value = view.state.doc.toString()
+  showAIPanel.value = false
+}
+
+function copyResult() {
+  if (!aiResult.value?.result) return
+  navigator.clipboard.writeText(aiResult.value.result).catch(() => {})
+}
+
+
 const editorView = shallowRef<EditorView>()
 let renderTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -832,6 +912,8 @@ onBeforeUnmount(() => {
         <button @click="toolbarActions.codeBlock()" title="代码块" class="tb-btn mono">```</button>
         <button @click="toolbarActions.table()" title="表格" class="tb-btn">⊞ 表格</button>
         <button @click="toolbarActions.hr()" title="分割线" class="tb-btn">—</button>
+        <span class="tb-sep"></span>
+        <button @click="showAIPanel = !showAIPanel" :class="{ active: showAIPanel }" title="AI 创作" class="tb-btn">✨ AI</button>
       </div>
       <div class="md-sep"></div>
       <div class="md-group">
@@ -864,6 +946,42 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- ─── 内容区 ─── -->
+    
+    <!-- ─── AI 创作面板 ─── -->
+    <div v-if="showAIPanel" class="ai-panel">
+      <div class="ai-panel-header">
+        <span>✨ AI 创作</span>
+        <button class="ai-close" @click="showAIPanel = false">×</button>
+      </div>
+      <div class="ai-actions">
+        <button v-for="a in aiActions" :key="a.key" @click="runAIAction(a.key)" :disabled="aiLoading" class="ai-action-btn">
+          {{ a.icon }} {{ a.label }}
+        </button>
+      </div>
+      <div v-if="aiLoading" class="ai-loading">⏳ AI 处理中...</div>
+      <div v-if="aiError" class="ai-error">⚠️ {{ aiError }}</div>
+      <div v-if="aiResult" class="ai-result">
+        <div v-if="aiResult.degraded" class="ai-degraded">⚠️ {{ aiResult.warning || '已降级为纯文本' }}</div>
+        <div v-if="aiResult.action === 'tags'">
+          <div v-if="aiResult.selected_tags?.length" class="ai-tags-section">
+            <div class="ai-tags-label">已添加标签：</div>
+            <span v-for="t in aiResult.selected_tags" :key="t" class="ai-tag">{{ t }}</span>
+          </div>
+          <div v-if="aiResult.suggested_new_tags?.length" class="ai-tags-section">
+            <div class="ai-tags-label">建议新标签（待确认）：</div>
+            <span v-for="t in aiResult.suggested_new_tags" :key="t" class="ai-tag ai-tag-suggest">{{ t }}</span>
+          </div>
+        </div>
+        <template v-else>
+          <div class="ai-result-text">{{ aiResult.result }}</div>
+          <div class="ai-result-actions">
+            <button @click="replaceWithResult" class="ai-replace-btn">替换原文</button>
+            <button @click="copyResult" class="ai-copy-btn">复制</button>
+          </div>
+        </template>
+      </div>
+    </div>
+
     <div class="editor-content" :class="editMode">
       <div v-show="editMode !== 'preview'" ref="editorContainer" class="cm-container"></div>
       <div v-show="editMode !== 'edit'" ref="previewRef" class="preview-pane" @click="handlePreviewClick" @scroll="handlePreviewScroll" v-html="previewHtml"></div>
@@ -1341,4 +1459,106 @@ onBeforeUnmount(() => {
   0% { background: rgba(122, 162, 247, 0.3); }
   100% { background: transparent; }
 }
+
+/* ─── P1-6 AI 创作面板 ─── */
+.ai-panel {
+  position: absolute;
+  top: 100px;
+  right: 20px;
+  width: 360px;
+  max-height: 70vh;
+  overflow-y: auto;
+  background: #1a1b26;
+  border: 1px solid #3b4261;
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  z-index: 100;
+}
+.ai-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid #3b4261;
+  font-weight: 600;
+  color: #7aa2f7;
+}
+.ai-close {
+  background: none;
+  border: none;
+  color: #565f89;
+  font-size: 20px;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.ai-close:hover { color: #a9b1d6; }
+.ai-actions {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  padding: 12px 16px;
+}
+.ai-action-btn {
+  padding: 8px 4px;
+  background: #292e42;
+  border: 1px solid #3b4261;
+  border-radius: 8px;
+  color: #a9b1d6;
+  cursor: pointer;
+  font-size: 13px;
+  transition: all 0.2s;
+}
+.ai-action-btn:hover:not(:disabled) {
+  background: #3b4261;
+  border-color: #7aa2f7;
+  color: #7aa2f7;
+}
+.ai-action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.ai-loading, .ai-error, .ai-degraded {
+  padding: 12px 16px;
+  font-size: 13px;
+}
+.ai-loading { color: #bb9af7; }
+.ai-error { color: #f7768e; }
+.ai-degraded { color: #e0af68; background: rgba(224,175,104,0.1); }
+.ai-result { padding: 12px 16px; border-top: 1px solid #3b4261; }
+.ai-result-text {
+  background: #16161e;
+  border: 1px solid #3b4261;
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #a9b1d6;
+  white-space: pre-wrap;
+  max-height: 200px;
+  overflow-y: auto;
+  margin-bottom: 10px;
+}
+.ai-result-actions { display: flex; gap: 8px; }
+.ai-replace-btn, .ai-copy-btn {
+  flex: 1;
+  padding: 8px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+}
+.ai-replace-btn { background: #7aa2f7; color: #1a1b26; }
+.ai-replace-btn:hover { background: #89b4fa; }
+.ai-copy-btn { background: #292e42; color: #a9b1d6; border: 1px solid #3b4261; }
+.ai-copy-btn:hover { background: #3b4261; }
+.ai-tags-section { margin-bottom: 10px; }
+.ai-tags-label { font-size: 12px; color: #565f89; margin-bottom: 6px; }
+.ai-tag {
+  display: inline-block;
+  padding: 3px 10px;
+  background: #292e42;
+  border-radius: 12px;
+  font-size: 12px;
+  color: #bb9af7;
+  margin: 2px 4px 2px 0;
+}
+.ai-tag-suggest { background: rgba(224,175,104,0.15); color: #e0af68; border: 1px dashed #e0af68; }
+
 </style>
