@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, nextTick } from 'vue'
-import { conversationsApi, chatStream, type Conversation, type ChatMessage } from '../api'
+import { conversationsApi, chatStream, chatWithTools, type Conversation, type ChatMessage, type ChatWithToolsResult, type ToolCall } from '../api'
 
 interface Provider {
   id: string
@@ -40,6 +40,8 @@ const apiKey = ref('')
 const customUrl = ref('')
 const input = ref('')
 const inputRef = ref<HTMLTextAreaElement | null>(null)
+const useTools = ref(false)  // P2 function calling 工具模式开关（默认关闭）
+const toolCalls = ref<ToolCall[]>([])  // 当前消息的工具调用过程
 
 // ─── 初始化加载 ───
 watch(() => props.visible, async (v) => {
@@ -230,6 +232,33 @@ async function sendMessage() {
   scrollToBottom()
 
   loading.value = true
+
+  // P2 工具模式：不走流式，走 chatWithTools 单轮 tool loop
+  if (useTools.value) {
+    toolCalls.value = []
+    isStreaming.value = false
+    try {
+      const config = {
+        api_url: selectedProvider.value === 'custom' ? customUrl.value : (providerConfigs.value[selectedProvider.value]?.url || ''),
+        api_key: apiKey.value,
+        model: selectedModel.value,
+      }
+      const result: ChatWithToolsResult = await chatWithTools(question, config)
+      assistantMsg.content = result.answer
+      toolCalls.value = result.tool_calls || []
+      if (result.degraded) {
+        assistantMsg.content = '⚠️ ' + (result.warning || '工具调用降级') + '\n\n' + result.answer
+      }
+    } catch (e: any) {
+      assistantMsg.content = '⚠️ 工具调用失败: ' + (e?.message || '未知错误')
+    } finally {
+      loading.value = false
+      await nextTick()
+      scrollToBottom()
+    }
+    return
+  }
+
   isStreaming.value = true
   abortController = new AbortController()
 
@@ -427,7 +456,17 @@ function relativeTime(dateStr: string): string {
                     <div class="msg-time">{{ relativeTime(msg.created_at) }}</div>
                   </div>
                   <div v-if="loading && !isStreaming" class="ai-message assistant loading">
-                    <div class="msg-content">思考中...</div>
+                    <div class="msg-content">{{ useTools ? '工具调用中...' : '思考中...' }}</div>
+                  </div>
+                  <!-- P2 工具调用过程展示 -->
+                  <div v-if="toolCalls.length" class="ai-tool-calls">
+                    <div class="tool-calls-title">🔧 工具调用 ({{ toolCalls.length }})</div>
+                    <div v-for="(tc, i) in toolCalls" :key="i" class="tool-call-item">
+                      <span class="tool-call-name">{{ tc.name }}</span>
+                      <span class="tool-call-status" :class="tc.status">{{ tc.status === 'success' ? '✓' : '✗' }}</span>
+                      <div class="tool-call-args">参数: {{ tc.args }}</div>
+                      <div v-if="tc.status === 'error'" class="tool-call-error">{{ tc.result }}</div>
+                    </div>
                   </div>
                 </div>
 
@@ -439,6 +478,13 @@ function relativeTime(dateStr: string): string {
 
                 <!-- 输入区 -->
                 <div class="ai-input-area">
+                  <div class="ai-tool-bar">
+                    <label class="tool-toggle" :class="{ active: useTools }">
+                      <input type="checkbox" v-model="useTools" />
+                      <span>🔧 工具模式</span>
+                    </label>
+                    <span v-if="useTools" class="tool-hint">搜索笔记 / 获取笔记内容</span>
+                  </div>
                   <textarea
                     ref="inputRef"
                     v-model="input"
@@ -907,4 +953,73 @@ function relativeTime(dateStr: string): string {
   white-space: nowrap;
 }
 .btn-cancel:hover { background: #5a6268; }
+
+/* P2 工具模式 */
+.ai-tool-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 0;
+}
+.tool-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.tool-toggle.active {
+  color: var(--accent);
+}
+.tool-toggle input {
+  cursor: pointer;
+}
+.tool-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.ai-tool-calls {
+  margin: 8px 0;
+  padding: 10px;
+  background: var(--bg-hover);
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--accent);
+}
+.tool-calls-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+.tool-call-item {
+  font-size: 12px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+.tool-call-item:last-child {
+  border-bottom: none;
+}
+.tool-call-name {
+  font-weight: 600;
+  color: var(--accent);
+}
+.tool-call-status {
+  margin-left: 8px;
+  font-size: 11px;
+}
+.tool-call-status.success { color: #9ece6a; }
+.tool-call-status.error { color: #f7768e; }
+.tool-call-args {
+  color: var(--text-muted);
+  font-size: 11px;
+  margin-top: 2px;
+  word-break: break-all;
+}
+.tool-call-error {
+  color: #f7768e;
+  font-size: 11px;
+  margin-top: 2px;
+}
 </style>

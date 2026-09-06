@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, onBeforeUnmount, nextTick } from 'vue'
 import * as d3 from 'd3'
-import { notesApi, type Note } from '../api'
+import { notesApi, graphQA, type Note, type GraphQAResult, type AIApiConfig } from '../api'
 
 const props = defineProps<{
   visible: boolean
@@ -82,6 +82,44 @@ async function loadGraph() {
   } finally {
     loading.value = false
   }
+}
+
+// ─── P2 图谱问答 ───
+const qaQuestion = ref('')
+const qaLoading = ref(false)
+const qaResult = ref<GraphQAResult | null>(null)
+const qaError = ref('')
+
+function getAIConfig(): AIApiConfig | null {
+  const provider = localStorage.getItem('ai-provider') || ''
+  if (!provider) return null
+  const cfgStr = localStorage.getItem(`ai-config-${provider}`)
+  if (!cfgStr) return null
+  try {
+    const cfg = JSON.parse(cfgStr)
+    return { api_url: cfg.url, api_key: cfg.key, model: cfg.model || localStorage.getItem('ai-model') || '' }
+  } catch { return null }
+}
+
+async function askGraphQA() {
+  const q = qaQuestion.value.trim()
+  if (!q) { qaError.value = '请输入问题'; return }
+  const config = getAIConfig()
+  if (!config || !config.api_key) { qaError.value = '请先配置 AI API Key'; return }
+  qaLoading.value = true
+  qaError.value = ''
+  qaResult.value = null
+  try {
+    qaResult.value = await graphQA(q, config)
+  } catch (e: any) {
+    qaError.value = e?.message || '问答失败'
+  } finally {
+    qaLoading.value = false
+  }
+}
+
+function openNote(n: { id: number; title: string }) {
+  emit('selectNote', { id: n.id, title: n.title, folder: '' } as Note)
 }
 
 function renderGraph() {
@@ -228,6 +266,43 @@ onBeforeUnmount(() => {
                 暂无笔记数据
               </div>
               <div ref="graphRef" class="graph-canvas"></div>
+              <!-- P2 图谱问答面板 -->
+              <div class="graph-qa-panel">
+                <div class="graph-qa-input-row">
+                  <input
+                    v-model="qaQuestion"
+                    class="graph-qa-input"
+                    placeholder="问图谱：哪些笔记引用了X？/ 总结X被哪些主题引用..."
+                    @keyup.enter="askGraphQA"
+                  />
+                  <button class="graph-qa-btn" @click="askGraphQA" :disabled="qaLoading">
+                    {{ qaLoading ? '思考中...' : '提问' }}
+                  </button>
+                </div>
+                <div v-if="qaError" class="graph-qa-error">{{ qaError }}</div>
+                <div v-if="qaResult" class="graph-qa-result">
+                  <div class="graph-qa-route">
+                    路由：<span :class="qaResult.route === 'structured' ? 'route-sql' : 'route-llm'">
+                      {{ qaResult.route === 'structured' ? '结构化(SQL)' : '非结构化(LLM)' }}
+                    </span>
+                    <span v-if="qaResult.degraded" class="qa-degraded">已降级</span>
+                  </div>
+                  <div v-if="qaResult.warning" class="graph-qa-warning">{{ qaResult.warning }}</div>
+                  <div v-if="qaResult.answer" class="graph-qa-answer">{{ qaResult.answer }}</div>
+                  <div v-if="qaResult.notes && qaResult.notes.length" class="graph-qa-notes">
+                    <div class="qa-notes-title">关联笔记 ({{ qaResult.notes.length }}):</div>
+                    <div v-for="n in qaResult.notes" :key="n.id" class="qa-note-item" @click="openNote(n)">
+                      📄 {{ n.title }}
+                    </div>
+                  </div>
+                  <div v-if="qaResult.sources && qaResult.sources.length" class="graph-qa-notes">
+                    <div class="qa-notes-title">引用来源:</div>
+                    <div v-for="s in qaResult.sources" :key="s.id" class="qa-note-item" @click="openNote(s)">
+                      📄 {{ s.title }}
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <div class="graph-footer">
@@ -392,5 +467,95 @@ onBeforeUnmount(() => {
 .graph-count {
   font-size: 11px;
   color: var(--text-faint);
+}
+
+/* P2 图谱问答 */
+.graph-qa-panel {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  right: 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px;
+  max-height: 45%;
+  overflow-y: auto;
+  backdrop-filter: blur(8px);
+}
+.graph-qa-input-row {
+  display: flex;
+  gap: 8px;
+}
+.graph-qa-input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 13px;
+  outline: none;
+}
+.graph-qa-input:focus {
+  border-color: var(--accent);
+}
+.graph-qa-btn {
+  padding: 8px 16px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: white;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.graph-qa-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.graph-qa-error {
+  color: var(--danger, #f7768e);
+  font-size: 12px;
+  margin-top: 6px;
+}
+.graph-qa-warning {
+  color: var(--warning, #e0af68);
+  font-size: 12px;
+  margin-top: 6px;
+}
+.graph-qa-result {
+  margin-top: 8px;
+}
+.graph-qa-route {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.route-sql { color: #9ece6a; font-weight: 600; }
+.route-llm { color: #7aa2f7; font-weight: 600; }
+.qa-degraded { color: #e0af68; margin-left: 8px; }
+.graph-qa-answer {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.graph-qa-notes {
+  margin-top: 8px;
+}
+.qa-notes-title {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.qa-note-item {
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 3px 0;
+}
+.qa-note-item:hover {
+  text-decoration: underline;
 }
 </style>

@@ -498,3 +498,67 @@ export async function aiAction(
 export async function getRecommendations(noteId: number): Promise<Recommendation[]> {
   return request<Recommendation[]>(/notes//recommendations)
 }
+
+
+// ─── P2 图谱问答 + function calling ───
+
+export interface GraphQAResult {
+  route: 'structured' | 'unstructured' | 'error'
+  notes?: Array<{ id: number; title: string; updated_at?: string }>
+  answer?: string
+  sources?: Array<{ id: number; title: string }>
+  direction?: string
+  note_id?: number
+  warning?: string
+  degraded?: boolean
+  error?: string
+}
+
+export interface ToolCall {
+  name: string
+  args: string
+  result: string
+  status: 'success' | 'error'
+}
+
+export interface ChatWithToolsResult {
+  answer: string
+  tool_calls: ToolCall[]
+  degraded?: boolean
+  warning?: string
+}
+
+// P2-1 知识图谱问答：结构化走SQL，非结构化走LLM
+export async function graphQA(
+  question: string,
+  config: AIApiConfig,
+  noteId?: number
+): Promise<GraphQAResult> {
+  const body: Record<string, unknown> = {
+    question,
+    api_url: config.api_url,
+    api_key: config.api_key,
+    model: config.model,
+  }
+  if (noteId) body.note_id = noteId
+  return request<GraphQAResult>('/ai/graph-qa', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+// P2-2 function calling 轻量用法：2个真实只读工具
+export async function chatWithTools(
+  question: string,
+  config: AIApiConfig
+): Promise<ChatWithToolsResult> {
+  return request<ChatWithToolsResult>('/ai/chat-with-tools', {
+    method: 'POST',
+    body: JSON.stringify({
+      question,
+      api_url: config.api_url,
+      api_key: config.api_key,
+      model: config.model,
+    }),
+  })
+}
