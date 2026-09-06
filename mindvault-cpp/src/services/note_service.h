@@ -3,6 +3,7 @@
 
 #include "../database.h"
 #include "../models/note.h"
+#include "chunk_service.h"
 #include <string>
 #include <vector>
 #include <regex>
@@ -64,7 +65,8 @@ public:
     }
 
     // 创建笔记
-    nlohmann::json Create(const std::string& title, const std::string& content = "", const std::string& folder = "default") {
+    nlohmann::json Create(const std::string& title, const std::string& content = "", const std::string& folder = "default",
+                              const std::string& api_url = "", const std::string& api_key = "", const std::string& model = "") {
         db_.Execute(
             "INSERT INTO notes (title, content, folder) VALUES (?, ?, ?)",
             {title, content, folder}
@@ -78,11 +80,21 @@ public:
         
         // 更新链接关系
         UpdateLinks(new_id, content);
+
+        // P1-5: 重建切块 + embedding（有 API 配置时同步调，3 秒超时；没配置只存文本）
+        try {
+            ChunkService chunk_svc(db_);
+            chunk_svc.RebuildChunksForNote(new_id, title, content, api_url, api_key, model);
+        } catch (...) {
+            // chunk 重建失败不影响笔记保存
+        }
+
         return GetById(new_id);
     }
 
     // 更新笔记
-    nlohmann::json Update(int64_t id, const std::string& title, const std::string& content, const std::string& folder = "") {
+    nlohmann::json Update(int64_t id, const std::string& title, const std::string& content, const std::string& folder = "",
+                            const std::string& api_url = "", const std::string& api_key = "", const std::string& model = "") {
         // 先手动同步 FTS5（删除旧记录）
         try {
             auto old = GetById(id);
@@ -116,6 +128,15 @@ public:
         }
         
         UpdateLinks(id, content);
+
+        // P1-5: 重建切块 + embedding（有 API 配置时同步调，3 秒超时；没配置只存文本）
+        try {
+            ChunkService chunk_svc(db_);
+            chunk_svc.RebuildChunksForNote(id, title, content, api_url, api_key, model);
+        } catch (...) {
+            // chunk 重建失败不影响笔记保存
+        }
+
         return GetById(id);
     }
 

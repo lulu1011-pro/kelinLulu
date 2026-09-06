@@ -79,7 +79,11 @@ inline void RegisterNoteRoutes(crow::App<>& app, Database& db) {
             std::string title   = body.value("title", std::string("Untitled"));
             std::string content = body.value("content", std::string(""));
             std::string folder  = body.value("folder", std::string("default"));
-            auto note = svc.Create(title, content, folder);
+            // P1-5: 可选的 embedding API 配置（前端有配置就传，没有就只切块不调 API）
+            std::string api_url = body.value("api_url", std::string(""));
+            std::string api_key = body.value("api_key", std::string(""));
+            std::string model   = body.value("model", std::string(""));
+            auto note = svc.Create(title, content, folder, api_url, api_key, model);
             return utils::JsonResp(utils::Success(note), 201);
         } catch (const std::exception& e) {
             return utils::JsonResp(utils::Error(e.what()), 400);
@@ -99,7 +103,11 @@ inline void RegisterNoteRoutes(crow::App<>& app, Database& db) {
             std::string title   = body.value("title", std::string(""));
             std::string content = body.value("content", std::string(""));
             std::string folder  = body.value("folder", std::string(""));
-            auto note = svc.Update(id, title, content, folder);
+            // P1-5: 可选的 embedding API 配置
+            std::string api_url = body.value("api_url", std::string(""));
+            std::string api_key = body.value("api_key", std::string(""));
+            std::string model   = body.value("model", std::string(""));
+            auto note = svc.Update(id, title, content, folder, api_url, api_key, model);
             if (note.is_null()) {
                 return utils::JsonResp(utils::NotFound("Note"), 404);
             }
