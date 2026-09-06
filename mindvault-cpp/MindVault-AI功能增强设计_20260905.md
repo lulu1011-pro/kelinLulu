@@ -1,6 +1,6 @@
 # MindVault AI 功能增强设计（面试价值导向 · 纯 API 版）
 
-> 文档版本：v1.1 ｜ 创建日期：2026-09-05 ｜ 状态：已实现（P0-1 多轮会话 / P0-2 SSE 流式 / P0-3.1 Query 改写 / P0-4 Token 预算，实现日期 2026-09-05）
+> 文档版本：v1.2 ｜ 创建日期：2026-09-05 ｜ 状态：已实现（P0-1 多轮会话 / P0-2 SSE 流式 / P0-3.1 Query 改写 / P0-4 Token 预算 / P1-5 混合检索，实现日期 2026-09-05）
 > 前提约束：不使用本地模型（Ollama 不装），全部走 OpenAI 兼容在线 API（通义 / 豆包 / OpenAI / 自定义已支持）。
 > 设计目标：每个功能都要能扛住面试官追问到第 3 层以上，而不是堆砌"我有这个功能"。
 
@@ -393,3 +393,116 @@ POST /api/ai/chat
 - 兼容回归：P0-1 会话 CRUD 全部正常，旧端点 /api/ai/chat 兼容
 - 前端：fetch+ReadableStream 逐块渲染，错误提示条+重试按钮，取消按钮，v-if 防白屏
 - 遗留：API Key 未配置时流式返回 error 事件（需配置 OpenAI 兼容 API Key 验证实际 delta 流式输出）；非流式未登录返回 404 而非 401（P0-1 遗留）
+
+
+---
+
+## 十四、P1-5 混合检索已实现记录（实现日期 2026-09-07）
+
+### 14.1 本批改动文件清单
+
+| 文件 | 改动类型 | 改动内容 |
+|------|----------|----------|
+| `src/database.h` | 修改 | 新增 `AddChunk`/`GetChunksByNote`/`DeleteChunksByNote`/`GetAllChunks` 四个方法声明 |
+| `src/database.cpp` | 修改 | `Init()` 新增 `note_chunks` 表 + 索引（`CREATE TABLE IF NOT EXISTS` 幂等）；实现四个 chunk CRUD 方法，全部参数化 |
+| `src/services/chunk_service.h` | **新增** | 切块逻辑（标题→段落→800字符窗口+50字重叠+句子边界对齐）、`EmbedText`（WinHTTP 3秒超时）、余弦相似度、`VectorSearch`（内存算余弦取topN）、`RebuildChunksForNote`（删旧→切块→存库→调embedding） |
+| `src/services/search_service.h` | 修改 | 新增 `HybridSearch` 方法：FTS5路 + 向量路 + RRF融合（k=60）+ embedding失败降级纯FTS5 + 日志；输出格式与`Search`完全一致 |
+| `src/routes/search_routes.h` | 修改 | `/api/search` 内部改用 `HybridSearch`，支持可选 `api_key`/`api_url`/`model` query参数；新增2000字符query长度限制 |
+| `src/routes/ai_routes.h` | 修改 | 非流式 + 流式两个端点的 RAG 检索都改用 `HybridSearch`（含 QueryRewrite 后重新检索） |
+| `src/services/note_service.h` | 修改 | `Create`/`Update` 增加可选 API 配置参数，保存后自动 `RebuildChunksForNote`（try/catch包裹，失败不影响保存） |
+| `src/routes/note_routes.h` | 修改 | POST/PUT 笔记从请求体读取可选 `api_url`/`api_key`/`model` 传给 service |
+
+**数据库迁移**：`note_chunks` 表用 `CREATE TABLE IF NOT EXISTS`，幂等，老库启动时自动建表，不影响已有数据。无需删旧库、无需 ALTER TABLE、无需数据迁移。老笔记无 chunk，需手动重新保存或后续加批量重建接口。
+
+### 14.2 API 变更（请求/响应格式兼容，前端零改动）
+
+#### GET /api/search（内部升级，格式不变）
+
+**请求**（新增可选参数）：
+```
+GET /api/search?q=process&api_key=sk-xxx&api_url=https://api.openai.com/v1/embeddings&model=text-embedding-3-small
+```
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| q | 是 | 搜索关键词，最大2000字符 |
+| api_key | 否 | embedding API key，为空时跳过向量路，纯FTS5 |
+| api_url | 否 | embedding API URL |
+| model | 否 | embedding 模型名 |
+
+**响应**（格式不变，与纯FTS5完全一致）：
+```json
+{
+  "ok": true,
+  "data": [
+    {"id": 4, "title": "OS Notes", "folder": "default", "updated_at": "...",
+     "title_highlight": "OS Notes", "content_highlight": ">>>Process<<< is the minimal unit..."}
+  ]
+}
+```
+
+**降级行为**：api_key 为空 / embedding API 失败 / 超时 / 返回格式错误 → 向量路跳过 → 直接返回 FTS5 结果，用户无感知，后端日志打印 `[HybridSearch] embedding failed, fallback to FTS5 only`。
+
+#### POST /api/notes（新增可选参数，格式不变）
+
+**请求**（新增可选参数）：
+```json
+{
+  "title": "OS Notes",
+  "content": "...",
+  "folder": "default",
+  "api_url": "https://api.openai.com/v1/embeddings",
+  "api_key": "sk-xxx",
+  "model": "text-embedding-3-small"
+}
+```
+
+有 API 配置时：保存笔记后自动切块 + 调 embedding + 存 `note_chunks` 表（3秒超时，失败只存文本不存向量）。
+无 API 配置时：只切块存文本，`embedding_json` 为 NULL，检索时跳过该 chunk。
+
+**响应**：不变，201 + 笔记详情。
+
+### 14.3 关键常量
+
+| 常量 | 值 | 位置 | 用途 |
+|------|-----|------|------|
+| `CHUNK_MAX_SIZE` | 800 | chunk_service.h | 单块最大字符数 |
+| `CHUNK_OVERLAP` | 50 | chunk_service.h | 相邻块重叠字符数（防切断语义） |
+| `CHUNK_MIN_SIZE` | 50 | chunk_service.h | 少于此长度的块跳过 |
+| `EMBEDDING_TIMEOUT_MS` | 3000 | chunk_service.h | embedding API 超时（毫秒） |
+| `RRF_K` | 60 | search_service.h | RRF 融合 k 值 |
+| query 长度限制 | 2000 | search_routes.h | 搜索 query 最大字符数（防超长URL连接重置） |
+
+### 14.4 切块规则（明确）
+
+1. 标题拼到内容前面（`# 标题
+
+内容`），保证 embedding 包含上下文
+2. 按 Markdown 标题（`#`/`##`/`###`）切分
+3. 没有标题的按空行段落切
+4. 单段超 800 字符按 800 窗口切，相邻块重叠 50 字符
+5. 窗口切分时从切分点往回找最近的句子结束符（。！？.!?），在句子边界切，不切断完整句子
+6. 单块少于 50 字符跳过
+
+### 14.5 RRF 融合算法
+
+```
+score(note_id) = Σ 1 / (60 + rank)
+```
+- FTS5 路和向量路各自排序，rank 从 1 开始
+- 两路都命中的笔记，分数是两路 rank 分数之和
+- 按融合分降序取 topN
+- **不做分数归一化**：FTS5 的 bm25 分数和余弦相似度量纲完全不同，归一化很难做对；RRF 只看排名不看分数，天然消除量纲差异
+
+### 14.6 验收测试结果（2026-09-07 自测）
+
+- 功能主链路：创建笔记→搜索"process"返回1条正确命中（highlight正常）；搜索"TCP"返回2条
+- 切块验证：笔记被切成4个chunk（97/96/89/109 chars），无API key时embedding全部为NULL
+- embedding降级：假API key搜索返回200+1条结果（降级FTS5），不报错
+- RRF：代码中 RRF_K=60，融合公式 1.0/(RRF_K+rank)，无归一化
+- 向量存储：embedding_json 为 TEXT 类型，未引入 sqlite-vec 扩展
+- 零依赖：复用 WinHTTP，无 LangChain/向量数据库
+- 边界：空q→400；超长3000字符→400（不崩溃）；异常id→404；重复创建→201/201
+- 兼容回归：P0会话功能全部正常（创建会话/列表/聊天/详情）
+- 前端：零改动，HybridSearch输出格式与Search一致，不会白屏
+- 已知问题：FTS5默认unicode61分词器不识别中文（非本批引入）；老笔记无chunk需手动重建；无真实API key无法端到端测向量路
