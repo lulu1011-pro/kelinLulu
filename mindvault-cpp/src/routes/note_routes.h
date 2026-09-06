@@ -222,7 +222,7 @@ inline void RegisterNoteRoutes(crow::App<>& app, Database& db) {
         // 先确认笔记存在
         auto note = svc.GetById(id);
         if (note.is_null()) {
-            return utils::JsonResp(utils::Error("笔记不存在"), 404);
+            return utils::JsonResp(utils::Error("笔记不存在", 404), 404);
         }
         auto recs = svc.GetRecommendations(id);
         return utils::JsonResp(utils::Success(recs));
