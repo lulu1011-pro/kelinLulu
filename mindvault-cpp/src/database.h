@@ -66,6 +66,12 @@ public:
     nlohmann::json GetAIMessages(int64_t conversation_id, int limit = 50);
     void UpdateAIMessageTokens(int64_t message_id, int tokens);
 
+    // ─── 笔记切块（P1-5 混合检索用）───
+    int64_t AddChunk(int64_t note_id, int chunk_index, const std::string& chunk_text, const std::string& embedding_json);
+    nlohmann::json GetChunksByNote(int64_t note_id);
+    void DeleteChunksByNote(int64_t note_id);
+    nlohmann::json GetAllChunks();
+
 private:
     sqlite3* db_ = nullptr;
 

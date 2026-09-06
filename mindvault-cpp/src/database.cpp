@@ -231,6 +231,19 @@ void Database::Init() {
     )");
     Execute("CREATE INDEX IF NOT EXISTS idx_ai_messages_conv ON ai_messages(conversation_id, created_at)");
 
+    // ─── 笔记切块表（P1-5 混合检索）───
+    Execute(R"(
+        CREATE TABLE IF NOT EXISTS note_chunks (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            note_id        INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+            chunk_index    INTEGER NOT NULL,
+            chunk_text     TEXT NOT NULL,
+            embedding_json TEXT DEFAULT NULL,
+            created_at     TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        )
+    )");
+    Execute("CREATE INDEX IF NOT EXISTS idx_note_chunks_note ON note_chunks(note_id)");
+
     std::cout << "[DB] Schema initialized (notes, tags, note_tags, link_edges, notes_fts, ai_conversations, ai_messages)" << std::endl;
 }
 
@@ -412,6 +425,37 @@ nlohmann::json Database::RowToJson(sqlite3_stmt* stmt) {
         }
     }
     return row;
+}
+
+
+// ─── 笔记切块操作（P1-5 混合检索）───
+
+int64_t Database::AddChunk(int64_t note_id, int chunk_index, const std::string& chunk_text, const std::string& embedding_json) {
+    Execute(
+        "INSERT INTO note_chunks (note_id, chunk_index, chunk_text, embedding_json) VALUES (?, ?, ?, ?)",
+        {note_id, chunk_index, chunk_text, embedding_json.empty() ? nullptr : nlohmann::json(embedding_json)}
+    );
+    return LastInsertId();
+}
+
+nlohmann::json Database::GetChunksByNote(int64_t note_id) {
+    return Query(
+        "SELECT id, note_id, chunk_index, chunk_text, embedding_json, created_at FROM note_chunks WHERE note_id = ? ORDER BY chunk_index",
+        {note_id}
+    );
+}
+
+void Database::DeleteChunksByNote(int64_t note_id) {
+    Execute("DELETE FROM note_chunks WHERE note_id = ?", {note_id});
+}
+
+nlohmann::json Database::GetAllChunks() {
+    return Query(
+        "SELECT c.id, c.note_id, c.chunk_index, c.chunk_text, c.embedding_json, n.title, n.folder "
+        "FROM note_chunks c INNER JOIN notes n ON n.id = c.note_id "
+        "WHERE n.is_deleted = 0 AND c.embedding_json IS NOT NULL "
+        "ORDER BY c.note_id, c.chunk_index"
+    );
 }
 
 } // namespace mindvault
