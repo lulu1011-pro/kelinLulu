@@ -186,6 +186,111 @@ export const conversationsApi = {
     }),
 }
 
+// ─── P0-2 SSE 流式对话 ───
+
+export interface StreamCallbacks {
+  onDelta: (delta: string) => void
+  onDone: (messageId: number, tokens: number) => void
+  onError: (error: string) => void
+}
+
+/**
+ * 流式对话：用 fetch + ReadableStream 逐块读取 SSE（EventSource 不支持 POST）
+ * 支持通过 AbortSignal 中途取消
+ */
+export async function chatStream(
+  req: ChatRequest,
+  callbacks: StreamCallbacks,
+  signal?: AbortSignal
+): Promise<void> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Accept': 'text/event-stream',
+  }
+  const token = getToken()
+  if (token) headers['Authorization'] = `Bearer ${token}`
+
+  let res: Response
+  try {
+    res = await fetch(`${API_BASE}/ai/chat/stream`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(req),
+      signal,
+    })
+  } catch (e: any) {
+    if (e.name === 'AbortError') {
+      callbacks.onError('请求已取消')
+    } else {
+      callbacks.onError(e.message || '网络错误')
+    }
+    return
+  }
+
+  if (!res.ok) {
+    let errMsg = `HTTP ${res.status}`
+    try {
+      const errJson = await res.json()
+      errMsg = errJson.error?.message || errMsg
+    } catch { /* ignore */ }
+    callbacks.onError(errMsg)
+    return
+  }
+
+  const reader = res.body?.getReader()
+  if (!reader) {
+    callbacks.onError('无响应体')
+    return
+  }
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+
+      // SSE 事件以空行（\n\n）分隔
+      let idx: number
+      while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const event = buffer.substring(0, idx)
+        buffer = buffer.substring(idx + 2)
+
+        // 解析 data: {...}
+        const dataMatch = event.match(/^data:\s*(.+)$/m)
+        if (!dataMatch) continue
+
+        const dataStr = dataMatch[1].trim()
+        if (!dataStr || dataStr === '[DONE]') continue
+
+        try {
+          const data = JSON.parse(dataStr)
+          if (data.type === 'delta') {
+            callbacks.onDelta(data.content || '')
+          } else if (data.type === 'done') {
+            callbacks.onDone(data.message_id || 0, data.tokens || 0)
+          } else if (data.type === 'error') {
+            callbacks.onError(data.message || '服务端错误')
+          }
+        } catch {
+          // 忽略解析失败的 chunk（可能是不完整的 JSON）
+        }
+      }
+    }
+  } catch (e: any) {
+    if (e.name === 'AbortError') {
+      callbacks.onError('请求已取消')
+    } else {
+      callbacks.onError(e.message || '流读取错误')
+    }
+  } finally {
+    try { reader.releaseLock() } catch { /* ignore */ }
+  }
+}
+
 // ─── Search ───
 
 export const searchApi = {
