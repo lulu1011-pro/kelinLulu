@@ -358,6 +358,10 @@ nlohmann::json Database::GetAIMessages(int64_t conversation_id, int limit) {
     );
 }
 
+void Database::UpdateAIMessageTokens(int64_t message_id, int tokens) {
+    Execute("UPDATE ai_messages SET tokens = ? WHERE id = ?", {tokens, message_id});
+}
+
 // ─── 内部方法 ───
 
 void Database::BindParams(sqlite3_stmt* stmt, const std::vector<nlohmann::json>& params) {
