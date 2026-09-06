@@ -22,7 +22,13 @@ users、notes、tags、note_tags、link_edges、versions、flashcards、permissi
 统一响应 {"ok":true,"data":...} / {"ok":false,"error":{code,message}};一律走 utils::Success/Error,不手拼 JSON。
 
 ## 当前进度(重要,先读这里)
-AI 增强 P0-1「多轮会话记忆」开发中:ai_conversations/ai_messages 表已建,database.cpp 已迁移;ai_routes.h 已有会话级互斥锁、MAX_HISTORY_TURNS=10、MAX_CONTEXT_TOKENS=8000、system prompt 截断。详细方案看 P0-1_DESIGN.md;P0/P1/P2 全量规划看 MindVault-AI功能增强设计_20260905.md。改 AI 功能时保持 /api/ai/chat 单轮调用兼容。
+- 多用户体系已上线(2026-09-05 提交):注册/登录鉴权,后端按 token 解析 user_id,每个用户独立 SQLite 库,所有查询带用户条件。
+- AI 增强 P0-1「多轮会话记忆」已完成并提交(2026-09-05,提交 2c0fa09 建表→72dc21b 会话 API→39c6b35 前端列表→e1f03f6 修 TS→89c6258 review):ai_conversations/ai_messages 表已建;会话 CRUD 全套;ai_routes.h 已有会话级互斥锁、MAX_HISTORY_TURNS=10、MAX_CONTEXT_TOKENS=8000、system prompt 截断;/api/ai/chat 兼容单轮(无 conversation_id)与会话模式。
+- AI 增强 P0-2「SSE 流式输出」已完成(2026-09-06):crow_all.h 打补丁新增 response.stream_sink_/stream_close_ 直写 socket;新增 HttpPostStream + SSEParser + CallOnlineAPIStream 流式基础设施;新增 /api/ai/chat/stream 端点(手动写 HTTP 头、逐块推 SSE、客户端断开检测、token 校准);前端 api.ts 新增 chatStream(fetch + ReadableStream + SSE 解析 + AbortController 取消);AIChatPanel 接入流式渲染(逐字输出+闪烁光标+取消按钮+错误提示+重试)。原有 /api/ai/chat 非流式端点保持兼容。
+- AI 增强 P0-3.1「Query 改写/指代消解」已完成(2026-09-06):新增 QueryRewrite 函数(取最近 2 轮历史 + 当前问题,调用模型改写为无指代独立问题,失败降级返回原问题);已接入 /api/ai/chat 和 /api/ai/chat/stream 端点,改写后重新检索。验证场景:先问「什么是 RAG」→「它和微调有什么区别」→「那我项目里现在用的是哪种」,第三句可正确消解指代。
+- AI 增强 P0-4「Token 预算」已完成(2026-09-06):buildHistory 已做从最老开始丢的 token 预算截断(系统提示词和当前问题永远保留);新增 usage 字段校准(API 返回 completion_tokens 后调用 UpdateAIMessageTokens 校准 assistant 消息 tokens);估算用字符粗估(length/3+1),再用 API usage 校准。不用精确 tokenizer 的原因:1)引入额外依赖增加体积 2)不同模型 tokenizer 不同 3)usage 字段是模型侧精确统计。
+- P0-3.2 引用溯源为半成品:后端响应已带 sources 字段(ai_routes.h 约 456 行),前端 AIChatPanel.vue 尚未展示来源,待补可点击来源。
+- 详细方案看 P0-1_DESIGN.md(已实现);P0/P1/P2 全量规划看 MindVault-AI功能增强设计_20260905.md。改 AI 功能时保持 /api/ai/chat 单轮调用兼容。
 
 ## 硬性约定(踩过的坑)
 1. 中文路径:SQLite 打开必须 sqlite3_open16(UTF-16 宽字符),ANSI 版打不开中文路径
