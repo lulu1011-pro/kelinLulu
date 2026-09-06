@@ -1,6 +1,6 @@
 # MindVault AI 功能增强设计（面试价值导向 · 纯 API 版）
 
-> 文档版本：v1.0 ｜ 创建日期：2026-09-05 ｜ 状态：设计稿，待实现
+> 文档版本：v1.1 ｜ 创建日期：2026-09-05 ｜ 状态：已实现（P0-1 多轮会话 / P0-2 SSE 流式 / P0-3.1 Query 改写 / P0-4 Token 预算，实现日期 2026-09-05）
 > 前提约束：不使用本地模型（Ollama 不装），全部走 OpenAI 兼容在线 API（通义 / 豆包 / OpenAI / 自定义已支持）。
 > 设计目标：每个功能都要能扛住面试官追问到第 3 层以上，而不是堆砌"我有这个功能"。
 
@@ -271,3 +271,125 @@ note_chunks(
 ---
 
 *本文档基于代码现状核对（ai_routes.h / database.cpp / AIChatPanel.vue / MindVault-AI架构.md），功能均可落到现有 C++/Vue 架构。*
+
+---
+
+## 十三、已实现记录（P0-1 / P0-2 / P0-3.1 / P0-4，实现日期 2026-09-05）
+
+### 13.1 本批改动文件清单
+
+| 文件 | 改动类型 | 改动内容 |
+|------|----------|----------|
+| `third_party/crow_all.h` | 修改 | response 类新增 public 字段 `stream_sink_` / `stream_close_`（std::function），connection 建立响应时绑定为 asio::write 直写 socket / shutdown_write+close；lambda 内加 try/catch 防异常崩溃 |
+| `src/database.h` | 修改 | 新增 `UpdateAIMessageTokens(int64_t message_id, int tokens)` 声明 |
+| `src/database.cpp` | 修改 | 实现 `UpdateAIMessageTokens`：`UPDATE ai_messages SET tokens = ? WHERE id = ?`（参数化） |
+| `src/routes/ai_routes.h` | 修改 | 新增：`QueryRewrite` 函数、`HttpPostStream`（WinHTTP 流式读取）、`SSEParser`（解析上游 SSE chunk）、`CallOnlineAPIStream`（流式调用+delta回调+abort检查）、`/api/ai/chat/stream` 端点；`/api/ai/chat` 接入 QueryRewrite；`buildHistory` 接入 token 预算截断；usage 字段校准 completion_tokens；SSE 端点全 try/catch + streamStarted 标志 + search_svc 值捕获 |
+| `web/src/api.ts` | 修改 | 新增 `StreamCallbacks` 接口（onDelta/onDone/onError）+ `chatStream` 函数（fetch + ReadableStream + getReader + SSE 解析 + AbortSignal 取消） |
+| `web/src/components/AIChatPanel.vue` | 修改 | script：sendMessage 重写为流式版本，新增 isStreaming/streamError/abortController/lastQuestion 状态，cancelStream/retryLast 函数；template：流式光标、取消按钮、错误提示条+重试按钮；CSS：.stream-cursor 动画、.stream-error-bar、.btn-retry、.btn-cancel |
+| `CLAUDE.md` | 修改 | 当前进度段落更新 P0-2/P0-3.1/P0-4 完成状态 |
+
+**数据库迁移**：无需迁移。`ai_messages.tokens` 列在 P0-1 建表时已存在（`CREATE TABLE IF NOT EXISTS` 幂等），`UpdateAIMessageTokens` 只是新增了对该列的 UPDATE 操作，老库文件不受影响。
+
+### 13.2 新增 API：POST /api/ai/chat/stream（SSE 流式）
+
+**请求**：
+```json
+POST /api/ai/chat/stream
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "conversation_id": 1,
+  "question": "什么是 RAG？",
+  "provider": "openai",
+  "model": "gpt-4o-mini",
+  "api_key": "sk-xxx",
+  "api_url": ""
+}
+```
+
+**响应**（`Content-Type: text/event-stream`，逐块推送）：
+```
+data: {"type":"start","conversation_id":1}
+
+data: {"type":"delta","content":"检索"}
+
+data: {"type":"delta","content":"增强"}
+
+data: {"type":"delta","content":"生成"}
+
+data: {"type":"done","message_id":42,"tokens":156}
+```
+
+**错误事件**（API Key 未配置或调用失败时）：
+```
+data: {"type":"start","conversation_id":1}
+
+data: {"type":"error","message":"请配置 API Key（流式暂不支持 ollama）"}
+
+data: {"type":"done","message_id":0,"tokens":0}
+```
+
+**SSE 事件类型说明**：
+| type | 含义 | 字段 |
+|------|------|------|
+| `start` | 流开始，会话已建立 | conversation_id |
+| `delta` | 增量文本片段 | content |
+| `error` | 上游 API 错误或网络异常 | message |
+| `done` | 流结束，消息已入库 | message_id, tokens |
+
+**客户端断开处理**：后端 `stream_sink_` lambda 内 try/catch 捕获 asio::write 异常，置 `aborted=true` 原子标志，后续写入全部跳过；DB 事务正常 Commit（用户消息已写入），上游 API 请求仍会跑完（无法中断第三方 API），但不再推给客户端。
+
+### 13.3 已有 API 扩展：POST /api/ai/chat（接入 QueryRewrite + token 校准）
+
+**请求**（不变，兼容 P0-1）：
+```json
+POST /api/ai/chat
+{
+  "conversation_id": 1,
+  "question": "它和微调有什么区别",
+  "provider": "openai",
+  "model": "gpt-4o-mini",
+  "api_key": "sk-xxx"
+}
+```
+
+**响应**（不变）：
+```json
+{
+  "ok": true,
+  "data": {
+    "answer": "RAG（检索增强生成）和微调的区别在于...",
+    "conversation_id": 1,
+    "message_id": 5,
+    "model": "gpt-4o-mini",
+    "provider": "openai",
+    "sources": []
+  }
+}
+```
+
+**内部新增流程**（对调用方透明）：
+1. 写入用户消息后，调用 `QueryRewrite`：取最近 2 轮（4条）历史 + 当前问题，构造改写 prompt 调用模型，输出无指代独立问题；历史不足 2 轮或改写失败时降级返回原问题
+2. 改写结果与原问题不同时，用改写后的 query 重新 FTS5 检索
+3. `buildHistory` 按 token 预算从最老消息开始截断（系统提示词+当前问题+检索上下文永远保留）
+4. 调用模型后，从响应 `usage.completion_tokens` 提取精确 token 数，调用 `UpdateAIMessageTokens` 校准 assistant 消息的 tokens 列（替代字符粗估值）
+
+### 13.4 关键常量（ai_routes.h）
+
+| 常量 | 值 | 用途 |
+|------|-----|------|
+| `MAX_HISTORY_TURNS` | 10 | 取历史消息最大轮数（20条） |
+| `MAX_CONTEXT_TOKENS` | 8000 | 上下文 token 预算上限 |
+| `SYSTEM_PROMPT_TOKENS` | 200 | 系统提示词预留 token |
+| `estimateTokens(s)` | `s.length()/3 + 1` | 字符粗估 token（中文约 1 字≈0.6-0.7 token，取保守值 1/3） |
+
+### 13.5 验收测试结果（2026-09-06 自测）
+
+- 功能主链路：非流式 /api/ai/chat 返回 200 + answer；流式 /api/ai/chat/stream 返回 200 + text/event-stream + start/error/done 三事件
+- SQL 注入：本批所有新写 SQL 全部参数化，零字符串拼接
+- 越权：所有会话/消息查询经 `GetAIConversation(convId, uid)` 校验归属（SQL `WHERE id=? AND user_id=?`），不可能查到别的用户数据
+- 边界：空 question→400；超长 10000 字符→200；异常 conversation_id→404；连续 3 条→[200,200,200]
+- 兼容回归：P0-1 会话 CRUD 全部正常，旧端点 /api/ai/chat 兼容
+- 前端：fetch+ReadableStream 逐块渲染，错误提示条+重试按钮，取消按钮，v-if 防白屏
+- 遗留：API Key 未配置时流式返回 error 事件（需配置 OpenAI 兼容 API Key 验证实际 delta 流式输出）；非流式未登录返回 404 而非 401（P0-1 遗留）

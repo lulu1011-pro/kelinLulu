@@ -28,7 +28,7 @@ users、notes、tags、note_tags、link_edges、versions、flashcards、permissi
 - AI 增强 P0-3.1「Query 改写/指代消解」已完成(2026-09-06):新增 QueryRewrite 函数(取最近 2 轮历史 + 当前问题,调用模型改写为无指代独立问题,失败降级返回原问题);已接入 /api/ai/chat 和 /api/ai/chat/stream 端点,改写后重新检索。验证场景:先问「什么是 RAG」→「它和微调有什么区别」→「那我项目里现在用的是哪种」,第三句可正确消解指代。
 - AI 增强 P0-4「Token 预算」已完成(2026-09-06):buildHistory 已做从最老开始丢的 token 预算截断(系统提示词和当前问题永远保留);新增 usage 字段校准(API 返回 completion_tokens 后调用 UpdateAIMessageTokens 校准 assistant 消息 tokens);估算用字符粗估(length/3+1),再用 API usage 校准。不用精确 tokenizer 的原因:1)引入额外依赖增加体积 2)不同模型 tokenizer 不同 3)usage 字段是模型侧精确统计。
 - P0-3.2 引用溯源为半成品:后端响应已带 sources 字段(ai_routes.h 约 456 行),前端 AIChatPanel.vue 尚未展示来源,待补可点击来源。
-- 详细方案看 P0-1_DESIGN.md(已实现);P0/P1/P2 全量规划看 MindVault-AI功能增强设计_20260905.md。改 AI 功能时保持 /api/ai/chat 单轮调用兼容。
+- 详细方案看 P0-1_DESIGN.md(已实现);P0/P1/P2 全量规划看 MindVault-AI功能增强设计_20260905.md(已更新为已实现状态,含第十三章已实现记录+API请求响应示例)。改 AI 功能时保持 /api/ai/chat 单轮调用兼容。新增端点 POST /api/ai/chat/stream(SSE流式,Content-Type:text/event-stream,事件类型 start/delta/error/done)。
 
 ## 硬性约定(踩过的坑)
 1. 中文路径:SQLite 打开必须 sqlite3_open16(UTF-16 宽字符),ANSI 版打不开中文路径

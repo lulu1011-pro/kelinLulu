@@ -7675,9 +7675,11 @@ namespace crow
         bool completed_{};
         std::function<void()> complete_request_handler_;
         std::function<bool()> is_alive_helper_;
+    public:
         // SSE streaming: direct socket write (bound by connection)
         std::function<void(const std::string&)> stream_sink_;
         std::function<void()> stream_close_;
+    private:
         static_file_info file_info;
     };
 } // namespace crow
@@ -9318,11 +9320,18 @@ namespace crow
                     return self->adaptor_.is_open();
                 };
                 res.stream_sink_ = [self](const std::string& data) {
-                    asio::write(self->adaptor_.socket(), asio::buffer(data));
+                    try {
+                        asio::write(self->adaptor_.socket(), asio::buffer(data));
+                    } catch (const std::exception& e) {
+                        // 客户端断开或写失败，静默处理（调用方会通过 aborted 标志感知）
+                        (void)e;
+                    }
                 };
                 res.stream_close_ = [self]() {
-                    self->adaptor_.shutdown_write();
-                    self->adaptor_.close();
+                    try {
+                        self->adaptor_.shutdown_write();
+                        self->adaptor_.close();
+                    } catch (...) { /* 忽略关闭时的异常 */ }
                 };
 
                 detail::middleware_call_helper<detail::middleware_call_criteria_only_global,
