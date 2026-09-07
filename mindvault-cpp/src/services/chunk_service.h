@@ -22,7 +22,8 @@ namespace mindvault::services {
 constexpr int CHUNK_MAX_SIZE = 800;       // 单块最大字符数
 constexpr int CHUNK_OVERLAP = 50;          // 相邻块重叠字符数（防切断语义）
 constexpr int CHUNK_MIN_SIZE = 50;          // 少于此长度的块跳过
-constexpr int EMBEDDING_TIMEOUT_MS = 3000; // embedding API 超时 3 秒
+constexpr int EMBEDDING_TIMEOUT_MS = 20000;// embedding API 超时（批量请求较慢）
+constexpr int EMBED_BATCH_SIZE = 16;        // 单次请求同时嵌入的文本条数（智谱上限 64，留余量）
 
 class ChunkService {
 public:
@@ -83,35 +84,74 @@ public:
         return chunks;
     }
 
-    // ─── 重建某篇笔记的 chunk（删旧→切块→存库→调 embedding）───
-    void RebuildChunksForNote(int64_t note_id, const std::string& title, const std::string& content,
+    // ─── 重建某篇笔记的 chunk（删旧→切块→存库→批量调 embedding）───
+    // 返回成功嵌入的 chunk 数（0 = 未配置 embedding 或接口失败）
+    // 批量嵌入（每组 EMBED_BATCH_SIZE 条）避免几千条逐条请求拖慢重建
+    int RebuildChunksForNote(int64_t note_id, const std::string& title, const std::string& content,
                                 const std::string& api_url = "", const std::string& api_key = "", const std::string& model = "") {
+        int embedded = 0;
         try {
             // 删旧 chunk
             db_.DeleteChunksByNote(note_id);
 
             // 切块
             auto chunks = SplitIntoChunks(title, content);
-            if (chunks.empty()) return;
+            if (chunks.empty()) return 0;
 
-            // 存库 + 调 embedding
-            for (size_t i = 0; i < chunks.size(); ++i) {
-                std::string embedding_json;
-                if (!api_key.empty() && !api_url.empty()) {
-                    auto vec = EmbedText(api_url, api_key, model, chunks[i]);
-                    if (!vec.empty()) {
-                        nlohmann::json j = vec;
-                        embedding_json = j.dump();
+            // 配置齐全：批量调 embedding 后入库
+            if (!api_key.empty() && !api_url.empty() && !model.empty()) {
+                for (size_t i = 0; i < chunks.size(); i += EMBED_BATCH_SIZE) {
+                    size_t end = std::min(chunks.size(), i + EMBED_BATCH_SIZE);
+                    std::vector<std::string> group(chunks.begin() + i, chunks.begin() + end);
+                    auto embs = EmbedTextsBatch(api_url, api_key, model, group);
+                    for (size_t j = 0; j < group.size(); ++j) {
+                        std::string embedding_json;
+                        if (j < embs.size() && !embs[j].empty()) {
+                            embedding_json = nlohmann::json(embs[j]).dump();
+                            ++embedded;
+                        }
+                        db_.AddChunk(note_id, static_cast<int>(i + j), group[j], embedding_json);
                     }
                 }
-                // embedding 失败时 embedding_json 为空，存 NULL
-                db_.AddChunk(note_id, static_cast<int>(i), chunks[i], embedding_json);
+                std::cout << "[Chunk] Rebuilt note " << note_id << ": " << chunks.size() << " chunks, embedded " << embedded << std::endl;
+            } else {
+                // 未配置 embedding：只存切块文本（向量路自动跳过，关键词路不受影响）
+                for (size_t i = 0; i < chunks.size(); ++i) {
+                    db_.AddChunk(note_id, static_cast<int>(i), chunks[i], "");
+                }
+                std::cout << "[Chunk] Rebuilt note " << note_id << " (text-only): " << chunks.size() << " chunks" << std::endl;
             }
-            std::cout << "[Chunk] Rebuilt note " << note_id << ": " << chunks.size() << " chunks" << std::endl;
         } catch (const std::exception& e) {
             std::cerr << "[Chunk] RebuildChunksForNote failed: " << e.what() << std::endl;
             // 失败不影响笔记保存，chunk 可能不完整，下次更新时重建
         }
+        return embedded;
+    }
+
+    // ─── 全量重建：所有未删除笔记重新切块并批量嵌入 ───
+    // 场景：首次配好 embedding 模型 / 更换 embedding 模型（维度变了必须重建）
+    // 返回 {notes, chunks, api_error}；api_error=true 表示首篇就全失败（多半是模型名/Key/余额问题），已提前中止
+    nlohmann::json RebuildAllEmbeddings(const std::string& api_url, const std::string& api_key, const std::string& model) {
+        nlohmann::json out = {{"notes", 0}, {"chunks", 0}, {"api_error", false}};
+        auto notes = db_.Query(
+            "SELECT id, title, content FROM notes WHERE is_deleted = 0 ORDER BY updated_at DESC"
+        );
+        for (auto& n : notes) {
+            int64_t id = n["id"].get<int64_t>();
+            std::string title = n.value("title", std::string(""));
+            std::string content = n.value("content", std::string(""));
+            int got = RebuildChunksForNote(id, title, content, api_url, api_key, model);
+            int notesDone = out["notes"].get<int>() + 1;
+            out["notes"] = notesDone;
+            out["chunks"] = out["chunks"].get<int>() + got;
+            // 第一篇有内容的笔记一个都没嵌上 → 大概率配置/余额问题，及时止损不空等几千次
+            if (notesDone == 1 && got == 0 && !content.empty()) {
+                std::cerr << "[Chunk] embedding API failed on first note, aborting reindex" << std::endl;
+                out["api_error"] = true;
+                break;
+            }
+        }
+        return out;
     }
 
     // ─── 向量搜索：读所有 chunk，内存算余弦，返回 topN ───
@@ -180,13 +220,16 @@ public:
         return dot / (std::sqrt(norm_a) * std::sqrt(norm_b));
     }
 
-    // ─── 调 embedding API（复用 WinHTTP，3 秒超时）───
-    // 失败返回空 vector
-    static std::vector<double> EmbedText(const std::string& api_url, const std::string& api_key,
-                                           const std::string& model, const std::string& text) {
-        std::vector<double> result;
+    // ─── 调 embedding API（OpenAI 兼容格式，一次请求多条文本）───
+    // POST {api_url}，body {"model": model, "input": [文本数组]}
+    // 返回与 texts 顺序对齐的向量列表；整组失败返回空（外层据此判定 API 不可用）
+    static std::vector<std::vector<double>> EmbedTextsBatch(
+        const std::string& api_url, const std::string& api_key,
+        const std::string& model, const std::vector<std::string>& texts) {
+        std::vector<std::vector<double>> result;
+        if (texts.empty()) return result;
 #ifdef _WIN32
-        if (api_url.empty() || api_key.empty()) return result;
+        if (api_url.empty() || api_key.empty() || model.empty()) return result;
 
         // 解析 URL
         std::string url = api_url;
@@ -208,17 +251,16 @@ public:
         }
         std::wstring host(host_str.begin(), host_str.end());
 
-        // 构造请求体
+        // 构造请求体：input 传字符串数组实现批量
         nlohmann::json body;
-        body["model"] = model.empty() ? "text-embedding-3-small" : model;
-        body["input"] = text;
+        body["model"] = model;
+        body["input"] = texts;
         std::string body_str = body.dump();
 
         // WinHTTP 调用（带超时）
         HINTERNET hSession = WinHttpOpen(L"MindVault/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
         if (!hSession) return result;
 
-        // 设置超时
         WinHttpSetTimeouts(hSession, EMBEDDING_TIMEOUT_MS, EMBEDDING_TIMEOUT_MS,
                             EMBEDDING_TIMEOUT_MS, EMBEDDING_TIMEOUT_MS);
 
@@ -264,25 +306,39 @@ public:
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
 
-        // 解析响应
+        // 解析响应 data[i].embedding（按 data 顺序对齐输入）
         try {
             nlohmann::json j = nlohmann::json::parse(response);
-            if (j.contains("data") && j["data"].is_array() && !j["data"].empty()) {
-                auto& emb = j["data"][0]["embedding"];
-                if (emb.is_array()) {
-                    for (auto& v : emb) {
-                        result.push_back(v.get<double>());
-                    }
-                }
+            if (j.contains("error")) {
+                std::cerr << "[Chunk] EmbedTexts API error: "
+                          << j["error"].value("message", std::string("unknown")).substr(0, 200) << std::endl;
+                return result;
+            }
+            if (!j.contains("data") || !j["data"].is_array()) return result;
+            result.resize(texts.size());
+            for (auto& d : j["data"]) {
+                int idx = d.value("index", -1);
+                if (idx < 0 || idx >= (int)result.size()) continue;
+                if (!d.contains("embedding") || !d["embedding"].is_array()) continue;
+                for (auto& v : d["embedding"]) result[idx].push_back(v.get<double>());
             }
         } catch (...) {
-            std::cerr << "[Chunk] EmbedText parse failed: " << response.substr(0, 200) << std::endl;
+            std::cerr << "[Chunk] EmbedTexts parse failed: " << response.substr(0, 200) << std::endl;
         }
 #else
         // 非 Windows 平台暂不支持 embedding
-        (void)api_url; (void)api_key; (void)model; (void)text;
+        (void)api_url; (void)api_key; (void)model; (void)texts;
 #endif
         return result;
+    }
+
+    // ─── 单条 embedding（查询向量用）───
+    // 失败返回空 vector
+    static std::vector<double> EmbedText(const std::string& api_url, const std::string& api_key,
+                                           const std::string& model, const std::string& text) {
+        auto batch = EmbedTextsBatch(api_url, api_key, model, {text});
+        if (!batch.empty()) return batch[0];
+        return {};
     }
 
 private:

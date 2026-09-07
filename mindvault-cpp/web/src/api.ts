@@ -155,6 +155,8 @@ export interface ChatRequest {
   model: string
   api_key: string
   api_url?: string
+  /** Embedding 向量模型名（如 embedding-3）。留空 = 只走关键词检索，不开语义检索 */
+  embedding_model?: string
   conversation_id?: number
 }
 
@@ -478,6 +480,14 @@ export interface AIApiConfig {
   api_url: string
   api_key: string
   model: string
+  /** 向量模型名（如 embedding-3），可选：不配则不开语义检索 */
+  embedding_model?: string
+}
+
+export interface ReindexResult {
+  notes: number
+  chunks: number
+  api_error: boolean
 }
 
 // 内容创作统一 action 接口：polish|expand|summarize|translate|outline|tags
@@ -567,6 +577,19 @@ export async function chatWithTools(
       api_url: config.api_url,
       api_key: config.api_key,
       model: config.model,
+    }),
+  })
+}
+
+// ─── 向量索引重建（配好 Embedding 模型后点一次，全量重跑）───
+export async function reindexAI(config: AIApiConfig): Promise<ReindexResult> {
+  return request<ReindexResult>('/ai/reindex', {
+    method: 'POST',
+    body: JSON.stringify({
+      api_url: config.api_url,
+      api_key: config.api_key,
+      model: config.model,
+      embedding_model: config.embedding_model,
     }),
   })
 }

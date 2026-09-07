@@ -3,6 +3,7 @@
 
 #include "../database.h"
 #include "../services/search_service.h"
+#include "user_routes.h"   // UserDbManager：聊天 RAG 必须检索"当前用户的笔记库"（笔记存于每用户独立库）
 #include "../services/ai_action_service.h"
 #include "../services/graph_qa_service.h"
 #include "../services/function_calling_service.h"
@@ -507,8 +508,69 @@ inline std::string QueryRewrite(Database& db, int64_t convId, const std::string&
     return rewritten;
 }
 
+// ─── RAG 检索 + 拼装上下文（含完整正文注入）───
+// 旧实现只把 FTS5 摘要片段（几十字）塞给模型，AI 看不到笔记正文；
+// 这里检索到候选笔记 id 后按 id 回查正文（截断 contentChars 字符），
+// results 供前端来源引用展示（P0-3.2），context 注入给模型作答。
+struct RagPayload {
+    nlohmann::json results;   // 来源引用（含 id/title）
+    std::string context;      // 注入模型的正文
+};
+
+inline RagPayload RetrieveAndBuild(services::SearchService& svc, const std::string& question,
+    const std::string& api_url, const std::string& api_key, const std::string& model,
+    const std::string& embedding_model, int top_n = 5, int content_chars = 1200) {
+    RagPayload out;
+    out.results = svc.HybridSearch(question, top_n, api_url, api_key, model, embedding_model);
+
+    // 1. 收集候选笔记 id
+    std::string id_csv;
+    for (auto& r : out.results) {
+        int64_t nid = r.value("id", int64_t(0));
+        if (nid > 0) {
+            if (!id_csv.empty()) id_csv += ",";
+            id_csv += std::to_string(nid);
+        }
+    }
+
+    // 2. 按 id 回查完整正文（关键词/向量路返回的只是摘要片段）
+    std::unordered_map<int64_t, std::pair<std::string, std::string>> full; // id -> (title, body)
+    if (!id_csv.empty()) {
+        try {
+            auto details = svc.QueryByNoteIds(id_csv, content_chars);
+            for (auto& d : details) {
+                int64_t nid = d.value("id", int64_t(0));
+                if (nid <= 0) continue;
+                full[nid] = {d.value("title", std::string("")), d.value("content_highlight", std::string(""))};
+            }
+        } catch (const std::exception& e) {
+            std::cout << "[RAG] QueryByNoteIds failed: " << e.what() << std::endl;
+        }
+    }
+
+    // 3. 按检索顺序拼上下文；正文缺失时退回结果里的摘要字段
+    for (size_t i = 0; i < out.results.size(); ++i) {
+        auto& r = out.results[i];
+        int64_t nid = r.value("id", int64_t(0));
+        std::string title = r.value("title", std::string(""));
+        std::string body = r.value("content_highlight", std::string(""));
+        if (body.empty()) body = r.value("title_highlight", std::string(""));
+        auto it = full.find(nid);
+        if (it != full.end()) {
+            if (!it->second.first.empty()) title = it->second.first;
+            if (!it->second.second.empty()) body = it->second.second;
+        }
+        // 清理 FTS5 snippet 高亮标记
+        size_t pos;
+        while ((pos = body.find(">>>")) != std::string::npos) body.replace(pos, 3, "");
+        while ((pos = body.find("<<<")) != std::string::npos) body.replace(pos, 3, "");
+        out.context += "[来源" + std::to_string(i + 1) + ": " + title + "]\n" + body + "\n\n";
+    }
+    std::cout << "[RAG] retrieved " << out.results.size() << " notes, context chars=" << out.context.size() << std::endl;
+    return out;
+}
+
 inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
-    auto search_svc = std::make_shared<services::SearchService>(db);
 
     // ──────────────────────────────────────────────
     // 会话管理路由
@@ -597,7 +659,7 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
     // POST /api/ai/chat - AI 聊天（兼容单轮 + 多轮会话）
     // ──────────────────────────────────────────────
     CROW_ROUTE(app, "/api/ai/chat").methods("POST"_method)
-    ([search_svc, &db](const crow::request& req) {
+    ([&db](const crow::request& req) {
         try {
             int64_t uid = extractUserId(req);
             auto body = nlohmann::json::parse(req.body);
@@ -606,6 +668,7 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
             std::string model = body.value("model", std::string("qwen-turbo"));
             std::string api_key = body.value("api_key", std::string(""));
             std::string api_url = body.value("api_url", std::string(""));
+            std::string embedding_model = body.value("embedding_model", std::string(""));
             int64_t convId = body.value("conversation_id", int64_t(0));
 
             std::cout << "[AI] Request: provider=" << provider << ", model=" << model
@@ -615,21 +678,12 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
                 return crow::response(400, utils::Error("Question is required").dump());
             }
 
-            // RAG: 检索相关笔记
-            auto results = search_svc->HybridSearch(question, 5, api_url, api_key, model);
-
-            // 构建检索上下文
-            std::string ragContext;
-            for (size_t i = 0; i < results.size(); ++i) {
-                auto& r = results[i];
-                std::string title = r.value("title", std::string(""));
-                std::string snippet = r.value("content_highlight", std::string(""));
-                if (snippet.empty()) snippet = r.value("title_highlight", std::string(""));
-                size_t pos;
-                while ((pos = snippet.find(">>>")) != std::string::npos) snippet.replace(pos, 3, "");
-                while ((pos = snippet.find("<<<")) != std::string::npos) snippet.replace(pos, 3, "");
-                ragContext += "[来源" + std::to_string(i + 1) + ": " + title + "]\n" + snippet + "\n\n";
-            }
+            // RAG: 检索"当前用户的笔记库"（笔记在每用户独立库里，主库 notes 为空——这是之前 RAG 取不到内容的根因）
+            auto user_db = (uid > 0) ? UserDbManager::Instance().GetUserDb(uid) : nullptr;
+            services::SearchService rag_svc(user_db ? *user_db : db);
+            auto rag = RetrieveAndBuild(rag_svc, question, api_url, api_key, model, embedding_model);
+            auto results = rag.results;
+            std::string ragContext = rag.context;
 
             std::string systemPrompt = "你是一个知识库助手。请基于参考资料回答问题。如果资料无法回答，请明确说明。";
             std::string answer;
@@ -660,18 +714,9 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
 
                     // 用改写后的问题重新检索（如果改写结果不同）
                     if (effectiveQuestion != question) {
-                        results = search_svc->HybridSearch(effectiveQuestion, 5, api_url, api_key, model);
-                        ragContext.clear();
-                        for (size_t i = 0; i < results.size(); ++i) {
-                            auto& r = results[i];
-                            std::string title = r.value("title", std::string(""));
-                            std::string snippet = r.value("content_highlight", std::string(""));
-                            if (snippet.empty()) snippet = r.value("title_highlight", std::string(""));
-                            size_t pos;
-                            while ((pos = snippet.find(">>>")) != std::string::npos) snippet.replace(pos, 3, "");
-                            while ((pos = snippet.find("<<<")) != std::string::npos) snippet.replace(pos, 3, "");
-                            ragContext += "[来源" + std::to_string(i + 1) + ": " + title + "]\n" + snippet + "\n\n";
-                        }
+                        auto rag2 = RetrieveAndBuild(rag_svc, effectiveQuestion, api_url, api_key, model, embedding_model);
+                        results = rag2.results;
+                        ragContext = rag2.context;
                         std::cout << "[AI] Re-searched with rewritten query" << std::endl;
                     }
 
@@ -817,7 +862,7 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
     // 与 /api/ai/chat 共享会话机制、QueryRewrite、token 预算
     // 前端用 fetch + ReadableStream 逐块渲染（EventSource 不支持 POST）
     CROW_ROUTE(app, "/api/ai/chat/stream").methods("POST"_method)
-    ([search_svc, &db](const crow::request& req, crow::response& res) {
+    ([&db](const crow::request& req, crow::response& res) {
         std::atomic<bool> aborted{false};
         bool streamStarted = false;  // 是否已发送 HTTP 响应头
         try {
@@ -828,6 +873,7 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
             std::string model = body.value("model", std::string("qwen-turbo"));
             std::string api_key = body.value("api_key", std::string(""));
             std::string api_url = body.value("api_url", std::string(""));
+            std::string embedding_model = body.value("embedding_model", std::string(""));
             int64_t convId = body.value("conversation_id", int64_t(0));
 
             std::cout << "[AI Stream] Request: provider=" << provider << ", model=" << model
@@ -846,21 +892,14 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
                 return;
             }
 
-            // RAG 检索
+            // RAG 检索（用户笔记库，含完整正文注入）
             std::cout << "[AI Stream] Starting RAG search..." << std::endl;
-            auto results = search_svc->HybridSearch(question, 5, api_url, api_key, model);
+            auto user_db = UserDbManager::Instance().GetUserDb(uid);
+            services::SearchService rag_svc(*user_db);
+            auto rag = RetrieveAndBuild(rag_svc, question, api_url, api_key, model, embedding_model);
+            auto results = rag.results;
+            std::string ragContext = rag.context;
             std::cout << "[AI Stream] RAG search done, results=" << results.size() << std::endl;
-            std::string ragContext;
-            for (size_t i = 0; i < results.size(); ++i) {
-                auto& r = results[i];
-                std::string title = r.value("title", std::string(""));
-                std::string snippet = r.value("content_highlight", std::string(""));
-                if (snippet.empty()) snippet = r.value("title_highlight", std::string(""));
-                size_t pos;
-                while ((pos = snippet.find(">>>")) != std::string::npos) snippet.replace(pos, 3, "");
-                while ((pos = snippet.find("<<<")) != std::string::npos) snippet.replace(pos, 3, "");
-                ragContext += "[来源" + std::to_string(i + 1) + ": " + title + "]\n" + snippet + "\n\n";
-            }
 
             std::string systemPrompt = "你是一个知识库助手。请基于参考资料回答问题。如果资料无法回答，请明确说明。";
             std::string answer;
@@ -891,18 +930,9 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
             // 3. P0-3.1 Query 改写
             std::string effectiveQuestion = QueryRewrite(db, convId, question, provider, model, api_key, api_url);
             if (effectiveQuestion != question) {
-                results = search_svc->HybridSearch(effectiveQuestion, 5, api_url, api_key, model);
-                ragContext.clear();
-                for (size_t i = 0; i < results.size(); ++i) {
-                    auto& r = results[i];
-                    std::string title = r.value("title", std::string(""));
-                    std::string snippet = r.value("content_highlight", std::string(""));
-                    if (snippet.empty()) snippet = r.value("title_highlight", std::string(""));
-                    size_t pos;
-                    while ((pos = snippet.find(">>>")) != std::string::npos) snippet.replace(pos, 3, "");
-                    while ((pos = snippet.find("<<<")) != std::string::npos) snippet.replace(pos, 3, "");
-                    ragContext += "[来源" + std::to_string(i + 1) + ": " + title + "]\n" + snippet + "\n\n";
-                }
+                auto rag2 = RetrieveAndBuild(rag_svc, effectiveQuestion, api_url, api_key, model, embedding_model);
+                results = rag2.results;
+                ragContext = rag2.context;
             }
 
             // 4. 读取历史（P0-4 token 预算截断）
@@ -1133,6 +1163,34 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
             services::FunctionCallingService svc(*user_db, caller);
             auto result = svc.ChatWithTools(question, api_url, api_key, model);
             return crow::response(utils::Success(result).dump());
+        } catch (const std::exception& e) {
+            return crow::response(400, utils::Error(e.what()).dump());
+        }
+    });
+
+    // POST /api/ai/reindex - 全量重建向量索引（配置好 Embedding 模型后点一次按钮）
+    // 把当前用户所有笔记重新切块并批量调 embedding；可能耗时较长（首次几千块约几分钟）
+    // embedding 接口地址由 api_url（.../chat/completions）自动推导为 .../embeddings
+    CROW_ROUTE(app, "/api/ai/reindex").methods("POST"_method)
+    ([&db](const crow::request& req) {
+        int64_t uid = extractUserId(req);
+        if (uid <= 0) return crow::response(401, utils::Error("未登录").dump());
+        try {
+            auto body = nlohmann::json::parse(req.body);
+            std::string api_url = body.value("api_url", std::string(""));
+            std::string api_key = body.value("api_key", std::string(""));
+            std::string embedding_model = body.value("embedding_model", std::string(""));
+            if (api_key.empty()) return crow::response(400, utils::Error("请先配置 API Key").dump());
+            if (embedding_model.empty()) return crow::response(400, utils::Error("请填写 Embedding 模型名（如 embedding-3）").dump());
+            auto embed_url = services::SearchService::DeriveEmbeddingsUrl(api_url);
+            if (embed_url.empty()) {
+                return crow::response(400, utils::Error("无法从 API URL 推导向量接口地址，请使用以 /chat/completions 结尾的地址").dump());
+            }
+
+            auto user_db = UserDbManager::Instance().GetUserDb(uid);
+            services::ChunkService chunk_svc(*user_db);
+            auto out = chunk_svc.RebuildAllEmbeddings(embed_url, api_key, embedding_model);
+            return crow::response(200, utils::Success(out).dump());
         } catch (const std::exception& e) {
             return crow::response(400, utils::Error(e.what()).dump());
         }

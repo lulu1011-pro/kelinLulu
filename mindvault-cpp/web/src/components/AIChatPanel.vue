@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, nextTick } from 'vue'
-import { conversationsApi, chatStream, chatWithTools, type Conversation, type ChatMessage, type ChatWithToolsResult, type ToolCall, type SearchResult, type Note } from '../api'
+import { conversationsApi, chatStream, chatWithTools, reindexAI, type Conversation, type ChatMessage, type ChatWithToolsResult, type ToolCall, type SearchResult, type Note } from '../api'
 
 interface Provider {
   id: string
@@ -37,9 +37,12 @@ const selectedProvider = ref(localStorage.getItem('ai-provider') || 'tongyi')
 const selectedModel = ref('')
 const ollamaAvailable = ref(false)
 const ollamaModels = ref<string[]>([])
-const providerConfigs = ref<Record<string, { key: string; url: string; model: string }>>({})
+const providerConfigs = ref<Record<string, { key: string; url: string; model: string; embeddingModel?: string }>>({})
 const apiKey = ref('')
 const customUrl = ref('')
+const embeddingModel = ref('')          // 向量模型名（如智谱 embedding-3）；空 = 不开语义检索
+const reindexing = ref(false)           // 重建向量索引中
+const reindexMsg = ref('')              // 重建结果提示
 const input = ref('')
 const inputRef = ref<HTMLTextAreaElement | null>(null)
 const useTools = ref(false)  // P2 function calling 工具模式开关（默认关闭）
@@ -84,14 +87,53 @@ function loadProviderConfig(provider: string) {
   apiKey.value = config.key
   customUrl.value = config.url
   if (config.model) selectedModel.value = config.model
+  embeddingModel.value = config.embeddingModel || ''
+  reindexMsg.value = ''
 }
 
 function saveProviderConfig() {
-  const config = { key: apiKey.value, url: customUrl.value, model: selectedModel.value }
+  const config = { key: apiKey.value, url: customUrl.value, model: selectedModel.value, embeddingModel: embeddingModel.value }
   providerConfigs.value[selectedProvider.value] = config
   localStorage.setItem(`ai-config-${selectedProvider.value}`, JSON.stringify(config))
   localStorage.setItem('ai-provider', selectedProvider.value)
   showSettings.value = false
+}
+
+// 全量重建向量索引：把当前用户所有笔记切块并批量调 embedding（首次几千块约几分钟）
+async function runReindex() {
+  if (reindexing.value) return
+  if (!apiKey.value) {
+    reindexMsg.value = '请先填写 API Key'
+    return
+  }
+  if (!embeddingModel.value.trim()) {
+    reindexMsg.value = '请先填写 Embedding 模型名（如 embedding-3）'
+    return
+  }
+  const api_url = currentApiUrl()
+  if (!api_url) {
+    reindexMsg.value = '请填写 API URL（需以 /chat/completions 结尾）'
+    return
+  }
+  reindexing.value = true
+  reindexMsg.value = ''
+  try {
+    const r = await reindexAI({
+      api_url,
+      api_key: apiKey.value,
+      model: selectedModel.value,
+      embedding_model: embeddingModel.value.trim(),
+    })
+    if (r.api_error) {
+      reindexMsg.value = '⚠️ 向量接口调用失败：请检查 Embedding 模型名、API Key、账户余额'
+    } else {
+      reindexMsg.value = `✅ 重建完成：${r.notes} 篇笔记、${r.chunks} 个分块已向量化（首次需几分钟属正常）`
+    }
+  } catch (e: any) {
+    reindexMsg.value = '⚠️ 重建失败: ' + (e?.message || '未知错误')
+  } finally {
+    reindexing.value = false
+  }
 }
 
 async function checkStatus() {
@@ -112,6 +154,13 @@ function getModels(): string[] {
   if (selectedProvider.value === 'ollama') return ollamaModels.value
   const p = providers.value.find(p => p.id === selectedProvider.value)
   return p?.models || []
+}
+
+// 当前生效的对话接口地址：自定义用输入框的值；预置提供商用状态接口返回的默认地址
+function currentApiUrl(): string {
+  if (selectedProvider.value === 'custom') return customUrl.value
+  return providerConfigs.value[selectedProvider.value]?.url ||
+         providers.value.find(p => p.id === selectedProvider.value)?.url || ''
 }
 
 // ─── 会话操作 ───
@@ -241,7 +290,7 @@ async function sendMessage() {
     isStreaming.value = false
     try {
       const config = {
-        api_url: selectedProvider.value === 'custom' ? customUrl.value : (providerConfigs.value[selectedProvider.value]?.url || ''),
+        api_url: currentApiUrl(),
         api_key: apiKey.value,
         model: selectedModel.value,
       }
@@ -271,7 +320,8 @@ async function sendMessage() {
         provider: selectedProvider.value,
         model: selectedModel.value,
         api_key: apiKey.value,
-        api_url: selectedProvider.value === 'custom' ? customUrl.value : '',
+        api_url: currentApiUrl(),
+        embedding_model: embeddingModel.value.trim() || undefined,
         conversation_id: activeConversationId.value,
       },
       {
@@ -409,7 +459,18 @@ function relativeTime(dateStr: string): string {
                 <label>Model:</label>
                 <input v-model="selectedModel" type="text" placeholder="例如 glm-4-flash / qwen-turbo" class="setting-input" />
               </div>
-              <button class="btn-save" @click="saveProviderConfig">保存</button>
+              <!-- Embedding 向量模型：语义检索用，可和对话模型不同（如对话用 glm-4-flash，向量用 embedding-3） -->
+              <div v-if="selectedProvider !== 'ollama'" class="setting-item">
+                <label>Embedding 模型:</label>
+                <input v-model="embeddingModel" type="text" placeholder="例如 embedding-3（智谱）/ text-embedding-v3（阿里）；不填=只开关键词检索" class="setting-input" />
+              </div>
+              <div style="display:flex;justify-content:flex-end;gap:8px;align-items:center;">
+                <button class="btn-save" @click="saveProviderConfig">保存</button>
+                <button v-if="selectedProvider !== 'ollama'" class="btn-save btn-reindex" @click="runReindex" :disabled="reindexing">
+                  {{ reindexing ? '重建中...' : '重建向量索引' }}
+                </button>
+              </div>
+              <div v-if="reindexMsg" class="reindex-msg">{{ reindexMsg }}</div>
             </div>
 
             <!-- 主体：会话列表 + 消息区 -->
@@ -677,6 +738,27 @@ function relativeTime(dateStr: string): string {
 
 .btn-save:hover {
   background: var(--accent-glow);
+}
+
+.btn-reindex {
+  border-color: #e94560;
+  color: #e94560;
+}
+
+.btn-reindex:hover {
+  background: rgba(233, 69, 96, 0.12);
+}
+
+.btn-reindex:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.reindex-msg {
+  font-size: 12px;
+  color: var(--text-muted);
+  word-break: break-all;
+  padding-left: 2px;
 }
 
 /* ─── 主体布局 ─── */

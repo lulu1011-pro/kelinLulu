@@ -81,10 +81,11 @@ public:
         // 更新链接关系
         UpdateLinks(new_id, content);
 
-        // P1-5: 重建切块 + embedding（有 API 配置时同步调，3 秒超时；没配置只存文本）
+        // P1-5: 重建切块（只存文本，不做 embedding，避免保存大笔记被接口拖死）
+        // embedding 由 AI 面板"重建向量索引"按钮统一生成（可换模型重跑）
         try {
             ChunkService chunk_svc(db_);
-            chunk_svc.RebuildChunksForNote(new_id, title, content, api_url, api_key, model);
+            chunk_svc.RebuildChunksForNote(new_id, title, content);
         } catch (...) {
             // chunk 重建失败不影响笔记保存
         }
@@ -129,10 +130,10 @@ public:
         
         UpdateLinks(id, content);
 
-        // P1-5: 重建切块 + embedding（有 API 配置时同步调，3 秒超时；没配置只存文本）
+        // P1-5: 重建切块（只存文本，不做 embedding，避免保存大笔记被接口拖死）
         try {
             ChunkService chunk_svc(db_);
-            chunk_svc.RebuildChunksForNote(id, title, content, api_url, api_key, model);
+            chunk_svc.RebuildChunksForNote(id, title, content);
         } catch (...) {
             // chunk 重建失败不影响笔记保存
         }

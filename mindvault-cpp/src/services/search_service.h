@@ -1,11 +1,19 @@
 #pragma once
-// 全文搜索服务：基于 FTS5
+// 全文搜索服务：基于 FTS5 + 中文友好的多路回退
+//
+// 为什么要有回退：SQLite FTS5 默认 unicode61 分词器把中文按"连续字符"
+// 当 phrase 匹配，用户一句自然语言长 query（如"总结一下C++基础这个笔记"）
+// 会被当成一个超长 phrase，几乎必然 0 命中。所以检索策略必须是：
+//   第 1 路：标题 LIKE（标题短，命中率高）
+//   第 2 路：FTS5 OR 查询（把 query 拆成多个关键词，OR 连接）
+//   第 3 路：正文 LIKE（最后兜底）
 
 #include "../database.h"
 #include "chunk_service.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <algorithm>
 #include <nlohmann/json.hpp>
 
 namespace mindvault::services {
@@ -14,98 +22,204 @@ class SearchService {
 public:
     explicit SearchService(Database& db) : db_(db) {}
 
-    // 转义 FTS5 特殊字符
-    static std::string EscapeFTS5(const std::string& query) {
-        std::string result;
-        for (char c : query) {
-            // 只保留字母、数字、中文和空格
-            if (std::isalnum(c) || c == ' ' || c == '\t' || c == '\n' ||
-                (c & 0x80)) {  // UTF-8 多字节字符
-                result += c;
-            }
-            // 其他字符替换为空格
-            else if (result.empty() || result.back() != ' ') {
-                result += ' ';
+    // ─── 中文检索辅助：停用词表 ───
+    // 自然语言问句里的虚词/语气词/泛指词，对检索无区分度
+    static const std::vector<std::string>& StopWords() {
+        static const std::vector<std::string> words = {
+            "什么", "怎么", "怎样", "如何", "为什么", "哪些", "哪个", "这个", "那个", "这些", "那些",
+            "里面", "中的", "上的", "什么", "一下", "一些", "一个", "一种", "的东西", "东西",
+            "笔记", "内容", "文章", "文档", "文件", "里面", "关于", "请问", "总结", "介绍", "讲解",
+            "说说", "讲讲", "帮我", "给我", "告诉", "知道", "介绍下", "总结下", "有没有", "有什么",
+            "吗", "呢", "啊", "吧", "呀", "哦", "嗯", "的", "了", "是", "在", "有", "和", "与", "或",
+            "对", "把", "被", "让", "给", "为", "而", "并", "且", "这", "那", "我", "你", "他", "她",
+            "它", "们", "也", "都", "就", "还", "又", "再", "能", "会", "要", "想", "可", "以", "从",
+            "到", "向", "跟", "同", "比", "更", "最", "很", "太", "好", "看", "写", "做", "用", "其",
+            "时", "候", "后", "前", "先", "间", "分", "别", "之", "以", "及", "个", "种", "条", "些",
+        };
+        return words;
+    }
+
+    // 判断字符是否为中文字符（UTF-8 三字节，E4-E9 开头）
+    static bool IsChineseLead(unsigned char c) {
+        return c >= 0xE4 && c <= 0xE9;
+    }
+
+    // 提取连续中文字符段（跳过非中文），返回 UTF-8 子串列表
+    static std::vector<std::string> ExtractChineseSegments(const std::string& query) {
+        std::vector<std::string> segs;
+        size_t i = 0, n = query.size();
+        while (i < n) {
+            // 一个汉字占 3 字节，需保证 i+3 <= n
+            if (IsChineseLead((unsigned char)query[i]) && i + 3 <= n) {
+                size_t start = i;
+                i += 3;
+                while (i + 3 <= n && IsChineseLead((unsigned char)query[i])) {
+                    i += 3;
+                }
+                segs.push_back(query.substr(start, i - start));
+            } else {
+                ++i;
             }
         }
-        // 去除首尾空格
-        size_t start = result.find_first_not_of(' ');
-        size_t end = result.find_last_not_of(' ');
-        if (start == std::string::npos) return "";
-        return result.substr(start, end - start + 1);
+        return segs;
+    }
+
+    // 从中文段提取关键词：优先 2 字词（滑窗），过滤停用词
+    static void AddChineseKeywords(const std::string& seg, std::vector<std::string>& out) {
+        // 滑窗取 2 字词；若剩余不足 2 字则整段
+        std::vector<std::string> grams;
+        for (size_t i = 0; i + 6 <= seg.size(); i += 3) {
+            grams.push_back(seg.substr(i, 6));  // 2 汉字
+        }
+        if (grams.empty() && !seg.empty()) grams.push_back(seg);
+
+        for (auto& g : grams) {
+            bool stop = false;
+            for (auto& sw : StopWords()) {
+                if (g.find(sw) != std::string::npos) { stop = true; break; }
+            }
+            if (!stop) out.push_back(g);
+        }
+    }
+
+    // 从 query 提取英文/数字关键词（C++、STL、shared_ptr、11 等）
+    static void AddAsciiKeywords(const std::string& query, std::vector<std::string>& out) {
+        std::string cur;
+        for (char c : query) {
+            if (std::isalnum((unsigned char)c) || c == '_') {
+                cur += c;
+            } else {
+                if (!cur.empty()) {
+                    if (cur.size() >= 2) out.push_back(cur);  // 单字母太宽泛，跳过
+                    cur.clear();
+                }
+            }
+        }
+        if (!cur.empty() && cur.size() >= 2) out.push_back(cur);
+    }
+
+    // 提取检索关键词列表（中文 2 字词 + 英文/数字 token），去重保序
+    static std::vector<std::string> ExtractKeywords(const std::string& query) {
+        std::vector<std::string> kws;
+        auto cjk = ExtractChineseSegments(query);
+        for (auto& seg : cjk) AddChineseKeywords(seg, kws);
+        AddAsciiKeywords(query, kws);
+
+        // 去重（保序）
+        std::vector<std::string> uniq;
+        for (auto& k : kws) {
+            if (std::find(uniq.begin(), uniq.end(), k) == uniq.end()) uniq.push_back(k);
+        }
+        return uniq;
+    }
+
+    // 按笔记 id 列表查询完整信息（供 RAG 取正文）
+    // ids: 逗号分隔字符串
+    nlohmann::json QueryByNoteIds(const std::string& idListCsv, int contentLimit = 1500) {
+        if (idListCsv.empty()) return nlohmann::json::array();
+        // 校验只含数字与逗号，防注入
+        for (char c : idListCsv) {
+            if (!std::isdigit((unsigned char)c) && c != ',') return nlohmann::json::array();
+        }
+        return db_.Query(R"(
+            SELECT id, title, folder, updated_at,
+                   title as title_highlight,
+                   substr(content, 1, ?) as content_highlight
+            FROM notes
+            WHERE id IN (SELECT value FROM json_each(?)) AND is_deleted = 0
+            ORDER BY updated_at DESC
+            LIMIT 50
+        )", {contentLimit, "[" + idListCsv + "]"});
+    }
+
+    // 标题模糊搜索（LIKE，最高优先级路）
+    nlohmann::json SearchByTitleKeywords(const std::vector<std::string>& kws, int limit = 20) {
+        if (kws.empty()) return nlohmann::json::array();
+        // 标题只要命中任一关键词即可
+        std::vector<nlohmann::json> params;
+        std::string sql =
+            "SELECT id, title, folder, updated_at, title as title_highlight, "
+            "substr(content, 1, 1500) as content_highlight "
+            "FROM notes WHERE is_deleted = 0 AND (";
+        for (size_t i = 0; i < kws.size(); ++i) {
+            if (i > 0) sql += " OR ";
+            sql += "title LIKE ?";
+            params.push_back("%" + kws[i] + "%");
+        }
+        sql += ") ORDER BY updated_at DESC LIMIT ?";
+        params.push_back(limit);
+        return db_.Query(sql, params);
     }
 
     // FTS5 全文搜索，返回匹配笔记列表
     nlohmann::json Search(const std::string& query, int limit = 50) {
         if (query.empty()) return nlohmann::json::array();
 
-        // 转义特殊字符
-        std::string escaped_query = EscapeFTS5(query);
+        // 第 0 路：直接标题精确/模糊搜索——自然语言里的标题命中
+        auto kws = ExtractKeywords(query);
 
-        // FTS5 MATCH 语法：默认按 OR 匹配关键词
-        nlohmann::json fts_results = db_.Query(R"(
-            SELECT n.id, n.title, n.folder, n.updated_at,
-                   snippet(notes_fts, 0, '>>>', '<<<', '...', 20) as title_highlight,
-                   snippet(notes_fts, 1, '>>>', '<<<', '...', 40) as content_highlight
-            FROM notes_fts f
-            INNER JOIN notes n ON n.id = f.rowid
-            WHERE notes_fts MATCH ? AND n.is_deleted = 0
-            ORDER BY rank
-            LIMIT ?
-        )", {escaped_query, limit});
-
-        // 中文/混合 query 兜底：FTS5 默认 unicode61 按字切，对长 query 命中率低；
-        // 没结果时用 LIKE 子串匹配兜底（中文笔记友好）。
-        if (fts_results.empty()) {
-            return SearchByContentSubstring(query, limit);
+        // 第 1 路：标题 LIKE（关键词任一命中标题）
+        if (!kws.empty()) {
+            auto by_title = SearchByTitleKeywords(kws, limit);
+            if (!by_title.empty()) return by_title;
         }
-        return fts_results;
+
+        // 第 2 路：FTS5 MATCH——把关键词 OR 起来（短语引号包裹，避免特殊字符语法错误）
+        if (!kws.empty()) {
+            std::string matchExpr;
+            for (size_t i = 0; i < kws.size() && i < 8; ++i) {
+                if (i > 0) matchExpr += " OR ";
+                matchExpr += "\"" + kws[i] + "\"";
+            }
+            if (!matchExpr.empty()) {
+                try {
+                    nlohmann::json fts_results = db_.Query(R"(
+                        SELECT n.id, n.title, n.folder, n.updated_at,
+                               snippet(notes_fts, 0, '>>>', '<<<', '...', 20) as title_highlight,
+                               snippet(notes_fts, 1, '>>>', '<<<', '...', 60) as content_highlight
+                        FROM notes_fts f
+                        INNER JOIN notes n ON n.id = f.rowid
+                        WHERE notes_fts MATCH ? AND n.is_deleted = 0
+                        ORDER BY rank
+                        LIMIT ?
+                    )", {matchExpr, limit});
+                    if (!fts_results.empty()) return fts_results;
+                } catch (...) { /* MATCH 语法错误则落到正文 LIKE */ }
+            }
+        }
+
+        // 第 3 路：正文 LIKE 兜底（取第一个有效关键词）
+        for (auto& k : kws) {
+            if (k.size() < 2) continue;
+            std::string likePattern = "%" + k + "%";
+            auto results = db_.Query(R"(
+                SELECT id, title, folder, updated_at,
+                       title as title_highlight,
+                       substr(content, 1, 1500) as content_highlight
+                FROM notes
+                WHERE (title LIKE ? OR content LIKE ?) AND is_deleted = 0
+                ORDER BY updated_at DESC
+                LIMIT ?
+            )", {likePattern, likePattern, limit});
+            if (!results.empty()) return results;
+        }
+
+        // 最后一搏：原样整句 LIKE（最宽松）
+        return SearchByRawQuery(query, limit);
     }
 
-    // 内容子串匹配（LIKE 兜底，专治 FTS5 中文检索不到）
-    // 用 query 中第一个中文字段或最长连续子串做 pattern，提高命中率
-    nlohmann::json SearchByContentSubstring(const std::string& query, int limit = 50) {
-        if (query.empty()) return nlohmann::json::array();
-
-        // 提取最长连续非空格子串（跳过停用词）做 pattern
-        std::string pattern = ExtractSearchKeyword(query);
-        if (pattern.empty()) return nlohmann::json::array();
-
-        std::string likePattern = "%" + pattern + "%";
-        auto results = db_.Query(R"(
+    // 原样整句子串 LIKE（最宽松兜底，仅当以上全空时）
+    nlohmann::json SearchByRawQuery(const std::string& query, int limit = 50) {
+        std::string likePattern = "%" + query + "%";
+        return db_.Query(R"(
             SELECT id, title, folder, updated_at,
                    title as title_highlight,
-                   substr(content, 1, 200) as content_highlight
+                   substr(content, 1, 1500) as content_highlight
             FROM notes
             WHERE (title LIKE ? OR content LIKE ?) AND is_deleted = 0
             ORDER BY updated_at DESC
             LIMIT ?
         )", {likePattern, likePattern, limit});
-
-        return results;
-    }
-
-    // 从 query 中提取最适合做 LIKE pattern 的关键词：
-    // 优先级：第一个中文字段 > 第一个英文/数字字段 > 整段去停用词
-    static std::string ExtractSearchKeyword(const std::string& query) {
-        // 简单策略：去掉标点和停用词，取最长非空段
-        const std::string stopChars = " ,.?!:;()[]{}\"'`~@#$%^&*+=|\\/，。？！：；（）【】\"\"''～";
-        std::string current, best;
-        auto flush = [&]() {
-            if (current.size() > best.size()) best = current;
-            current.clear();
-        };
-        for (char c : query) {
-            if (stopChars.find(c) != std::string::npos) {
-                flush();
-            } else {
-                current += c;
-            }
-        }
-        flush();
-        // 限长避免 LIKE 过慢
-        if (best.size() > 32) best = best.substr(0, 32);
-        return best;
     }
 
     // 按标题模糊搜索（非全文索引，走 LIKE）
@@ -120,21 +234,44 @@ public:
         )", {pattern, limit});
     }
 
+    // 从 chat 接口地址推导 embeddings 接口地址：
+    //   https://open.bigmodel.cn/api/paas/v4/chat/completions
+    //     → https://open.bigmodel.cn/api/paas/v4/embeddings
+    // 各家 OpenAI 兼容网关都遵循 "路径/chat/completions → /embeddings" 的规律
+    // （智谱、阿里百炼 compatible-mode、火山方舟 ark、OpenAI 本体均是如此）
+    static std::string DeriveEmbeddingsUrl(const std::string& chat_url) {
+        const std::string suffix = "/chat/completions";
+        if (chat_url.size() > suffix.size() &&
+            chat_url.compare(chat_url.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            return chat_url.substr(0, chat_url.size() - suffix.size()) + "/embeddings";
+        }
+        const std::string emb_suffix = "/embeddings";
+        if (chat_url.size() >= emb_suffix.size() &&
+            chat_url.compare(chat_url.size() - emb_suffix.size(), emb_suffix.size(), emb_suffix) == 0) {
+            return chat_url; // 已是 embeddings 地址
+        }
+        return ""; // 无法推导则放弃向量路（关键词检索不受影响）
+    }
+
     // ─── P1-5 混合检索：FTS5 关键词路 + 向量语义路 + RRF 融合 ───
-    // api_url/api_key/model 为空时跳过向量路，纯 FTS5（降级）
+    // api_url/api_key = 对话模型的接口与密钥；embedding_model 为空时跳过向量路（降级纯 FTS5）
+    // embedding 接口地址由 api_url 自动推导（DeriveEmbeddingsUrl）
     nlohmann::json HybridSearch(const std::string& query, int limit = 50,
                                   const std::string& api_url = "", const std::string& api_key = "",
-                                  const std::string& model = "") {
+                                  const std::string& model = "",
+                                  const std::string& embedding_model = "") {
         if (query.empty()) return nlohmann::json::array();
 
         // 第 1 步：FTS5 关键词路（取 limit*2，给融合留余量）
         nlohmann::json fts_results = Search(query, limit * 2);
 
-        // 第 2 步：向量语义路
+        // 第 2 步：向量语义路（需要：已配置 embedding 模型 + 能从对话地址推导出向量地址）
         nlohmann::json vec_results = nlohmann::json::array();
         bool vector_ok = false;
-        if (!api_url.empty() && !api_key.empty()) {
-            auto query_emb = ChunkService::EmbedText(api_url, api_key, model, query);
+        std::string embedding_url = DeriveEmbeddingsUrl(api_url);
+        if (!api_key.empty() && !embedding_model.empty() && !embedding_url.empty()) {
+            std::cout << "[HybridSearch] embedding: url=" << embedding_url << ", model=" << embedding_model << std::endl;
+            auto query_emb = ChunkService::EmbedText(embedding_url, api_key, embedding_model, query);
             if (!query_emb.empty()) {
                 ChunkService chunk_svc(db_);
                 vec_results = chunk_svc.VectorSearch(query_emb, limit * 2);
@@ -142,6 +279,8 @@ public:
             } else {
                 std::cout << "[HybridSearch] embedding failed, fallback to FTS5 only" << std::endl;
             }
+        } else if (!embedding_model.empty() && embedding_url.empty()) {
+            std::cout << "[HybridSearch] cannot derive embeddings url from api_url: " << api_url << std::endl;
         }
 
         // 向量路失败或未配置：直接返回 FTS5 结果
