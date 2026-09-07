@@ -970,9 +970,9 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
             db.Execute("UPDATE ai_conversations SET updated_at = datetime('now','localtime') WHERE id = ?", {convId});
             db.Commit();
 
-            // 9. 发送结束事件
+            // 9. 发送结束事件（P0-3.2 引用溯源：done 事件带检索来源，供前端展示可点击引用）
             if (!aborted.load()) {
-                nlohmann::json doneEvt = {{"type", "done"}, {"message_id", msgId}, {"tokens", completionTokens}};
+                nlohmann::json doneEvt = {{"type", "done"}, {"message_id", msgId}, {"tokens", completionTokens}, {"sources", results}};
                 res.stream_sink_("data: " + doneEvt.dump() + "\n\n");
             }
 
