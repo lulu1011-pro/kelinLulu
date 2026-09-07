@@ -4,10 +4,11 @@ echo   MindVault Launcher
 echo ========================================
 
 echo [1/2] Starting backend ...
-start "MindVault-Backend" "D:\kelin\AI项目\mindvault-cpp\build\Release\mindvault.exe"
+start "MindVault-Backend" "%~dp0build\Release\mindvault.exe"
 
+cd /d "%~dp0web"
 echo [2/2] Starting frontend ...
-cd /d "D:\kelin\AI项目\mindvault-cpp\web"
+
 start "MindVault-Frontend" cmd /k "npm run dev > vite-dev.log 2>&1"
 
 echo.

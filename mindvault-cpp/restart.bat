@@ -9,11 +9,12 @@ taskkill /F /IM node.exe 2>nul
 timeout /t 1 /nobreak >nul
 
 echo [2/3] Starting backend ...
-start "MindVault-Backend" "D:\kelin\AI项目\mindvault-cpp\build\Release\mindvault.exe"
+start "MindVault-Backend" "%~dp0build\Release\mindvault.exe"
 
+cd /d "%~dp0web"
 echo [3/3] Starting frontend ...
-cd /d "D:\kelin\AI项目\mindvault-cpp\web"
-start "MindVault-Frontend" cmd /k "npm run dev"
+
+start "MindVault-Frontend" cmd /k "npm run dev > vite-dev.log 2>&1"
 
 echo.
 echo Waiting for frontend port 5173 to be ready ...
