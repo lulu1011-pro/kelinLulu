@@ -313,6 +313,38 @@ async function sendMessage() {
   isStreaming.value = true
   abortController = new AbortController()
 
+  // ─── 打字机节流渲染 ───
+  // 上游（智谱等）的 SSE delta 常常一次来一大坨（几十~几百字），
+  // 如果 onDelta 收到多少就 append 多少，观感就是"憋一会儿 → 哗一下全出来"。
+  // 这里把 delta 先收进 pending 队列，由定时器按小步长匀速吐给 UI，
+  // 让"光标闪烁 + 逐字/逐小段出现"真实可见；流结束后快速清空积压。
+  let typePending = ''
+  let typeFinished = false
+  let typeTimer: ReturnType<typeof setInterval> | null = null
+
+  const pumpTypewriter = () => {
+    if (typeFinished) {
+      // 流已结束：把剩余积压一次性吐完
+      if (typePending) {
+        assistantMsg.content += typePending
+        typePending = ''
+        scrollToBottom()
+      }
+      if (typeTimer) { clearInterval(typeTimer); typeTimer = null }
+      return
+    }
+    if (!typePending) return
+    // 自适应步长：积压越多单步吐越多，避免长回答拖太久；平时 1~3 字有打字机感
+    const step = typePending.length > 800 ? 16 : typePending.length > 300 ? 8 : typePending.length > 60 ? 4 : 2
+    assistantMsg.content += typePending.slice(0, step)
+    typePending = typePending.slice(step)
+    scrollToBottom()
+  }
+  const flushTypewriter = () => {
+    typeFinished = true
+    pumpTypewriter()
+  }
+
   try {
     await chatStream(
       {
@@ -326,8 +358,8 @@ async function sendMessage() {
       },
       {
         onDelta: (delta: string) => {
-          assistantMsg.content += delta
-          scrollToBottom()
+          typePending += delta
+          if (!typeTimer) typeTimer = setInterval(pumpTypewriter, 30)
         },
         onReasoning: (delta: string) => {
           // 智谱思考模型：实时累积思考过程到 assistantMsg.reasoning
@@ -339,6 +371,8 @@ async function sendMessage() {
           if (tokens > 0) assistantMsg.tokens = tokens
           // P0-3.2 引用溯源：保存检索来源供下方渲染
           if (sources && sources.length > 0) assistantMsg.sources = sources
+          // 标记流结束，下一个 tick 清空积压（避免等 done 后还有字没显示）
+          typeFinished = true
         },
         onError: (error: string) => {
           streamError.value = error
@@ -347,6 +381,9 @@ async function sendMessage() {
       },
       abortController.signal
     )
+
+    // 流结束：清空打字机积压
+    pumpTypewriter()
 
     // 如果有错误且内容为空，标记为错误消息
     if (streamError.value && !assistantMsg.content) {
@@ -368,6 +405,8 @@ async function sendMessage() {
       assistantMsg.content = '⚠️ 请求失败，请检查后端服务。'
     }
   } finally {
+    // 兜底：无论成功/失败/取消，都清掉定时器和积压，确保消息完整
+    flushTypewriter()
     loading.value = false
     isStreaming.value = false
     abortController = null
