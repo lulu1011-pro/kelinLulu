@@ -571,8 +571,8 @@ function relativeTime(dateStr: string): string {
                   </div>
                 </div>
 
-                <!-- 错误提示 + 重试 -->
-                <div v-if="streamError" class="stream-error-bar">
+                <!-- 错误提示 + 重试：仅当最后一条消息没有内容时才显示（避免"内容已显示还报红条"） -->
+                <div v-if="streamError && (!messages.length || messages[messages.length - 1].role !== 'assistant' || !messages[messages.length - 1].content)" class="stream-error-bar">
                   <span class="stream-error-text">⚠️ {{ streamError }}</span>
                   <button class="btn-retry" @click="retryLast">重试</button>
                 </div>

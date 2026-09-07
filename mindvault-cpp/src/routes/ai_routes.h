@@ -998,7 +998,8 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
                 completionTokens = sr.completionTokens;
                 // 把 reasoning 提到 #ifdef 外保存用
                 savedReasoning = sr.fullReasoning;
-                if (!sr.success && !aborted.load()) {
+                // 只在确实没拿到内容时发错误（拿到任何 delta 都不发，避免"内容已显示还报红条"）
+                if (!sr.success && !aborted.load() && answer.empty()) {
                     nlohmann::json errEvt = {{"type", "error"}, {"message", sr.error.empty() ? "API 请求失败" : sr.error}};
                     res.stream_sink_("data: " + errEvt.dump() + "\n\n");
                 }
