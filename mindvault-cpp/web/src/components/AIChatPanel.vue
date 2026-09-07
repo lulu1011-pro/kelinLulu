@@ -399,6 +399,10 @@ function relativeTime(dateStr: string): string {
                 <label>API URL:</label>
                 <input v-model="customUrl" type="text" placeholder="https://api.example.com/v1/chat/completions" class="setting-input" />
               </div>
+              <div v-if="selectedProvider === 'custom'" class="setting-item">
+                <label>Model:</label>
+                <input v-model="selectedModel" type="text" placeholder="例如 glm-4-flash / qwen-turbo" class="setting-input" />
+              </div>
               <button class="btn-save" @click="saveProviderConfig">保存</button>
             </div>
 
