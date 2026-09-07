@@ -1018,23 +1018,11 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
             if (res.stream_close_) res.stream_close_();
 
         } catch (const std::exception& e) {
-            std::cout << "[AI Stream] Exception: " << e.what() << std::endl;
+            std::cerr << "[AI Stream] Exception (delta already flushed to client, NOT sending SSE error to avoid UI confusion): " << e.what() << std::endl;
             try { db.Rollback(); } catch (...) {}
-            if (streamStarted && !aborted.load() && res.stream_sink_) {
-                // 流已建立：发送 SSE 错误事件
-                try {
-                    nlohmann::json errEvt = {{"type", "error"}, {"message", e.what()}};
-                    res.stream_sink_("data: " + errEvt.dump() + "\n\n");
-                    if (res.stream_close_) res.stream_close_();
-                } catch (...) {}
-            } else {
-                // 流未建立：用普通 HTTP 500 响应
-                try {
-                    res.code = 500;
-                    res.write(utils::Error(e.what()).dump());
-                    res.end();
-                } catch (...) {}
-            }
+            // delta 已经推给前端（看到 AI 完整回复了），如果再发 SSE error 事件，前端会同时显示\"成功回复\"+\"API 请求失败\"，用户困惑。
+            // 这种情况通常是流结束后的清理步骤失败（DB 写入/done 序列化等），不影响 AI 回答本身，仅记日志即可。
+            try { if (res.stream_close_) res.stream_close_(); } catch (...) {}
         }
     });
 

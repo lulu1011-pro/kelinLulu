@@ -43,7 +43,7 @@ public:
         std::string escaped_query = EscapeFTS5(query);
 
         // FTS5 MATCH 语法：默认按 OR 匹配关键词
-        return db_.Query(R"(
+        nlohmann::json fts_results = db_.Query(R"(
             SELECT n.id, n.title, n.folder, n.updated_at,
                    snippet(notes_fts, 0, '>>>', '<<<', '...', 20) as title_highlight,
                    snippet(notes_fts, 1, '>>>', '<<<', '...', 40) as content_highlight
@@ -53,6 +53,59 @@ public:
             ORDER BY rank
             LIMIT ?
         )", {escaped_query, limit});
+
+        // 中文/混合 query 兜底：FTS5 默认 unicode61 按字切，对长 query 命中率低；
+        // 没结果时用 LIKE 子串匹配兜底（中文笔记友好）。
+        if (fts_results.empty()) {
+            return SearchByContentSubstring(query, limit);
+        }
+        return fts_results;
+    }
+
+    // 内容子串匹配（LIKE 兜底，专治 FTS5 中文检索不到）
+    // 用 query 中第一个中文字段或最长连续子串做 pattern，提高命中率
+    nlohmann::json SearchByContentSubstring(const std::string& query, int limit = 50) {
+        if (query.empty()) return nlohmann::json::array();
+
+        // 提取最长连续非空格子串（跳过停用词）做 pattern
+        std::string pattern = ExtractSearchKeyword(query);
+        if (pattern.empty()) return nlohmann::json::array();
+
+        std::string likePattern = "%" + pattern + "%";
+        auto results = db_.Query(R"(
+            SELECT id, title, folder, updated_at,
+                   title as title_highlight,
+                   substr(content, 1, 200) as content_highlight
+            FROM notes
+            WHERE (title LIKE ? OR content LIKE ?) AND is_deleted = 0
+            ORDER BY updated_at DESC
+            LIMIT ?
+        )", {likePattern, likePattern, limit});
+
+        return results;
+    }
+
+    // 从 query 中提取最适合做 LIKE pattern 的关键词：
+    // 优先级：第一个中文字段 > 第一个英文/数字字段 > 整段去停用词
+    static std::string ExtractSearchKeyword(const std::string& query) {
+        // 简单策略：去掉标点和停用词，取最长非空段
+        const std::string stopChars = " ,.?!:;()[]{}\"'`~@#$%^&*+=|\\/，。？！：；（）【】\"\"''～";
+        std::string current, best;
+        auto flush = [&]() {
+            if (current.size() > best.size()) best = current;
+            current.clear();
+        };
+        for (char c : query) {
+            if (stopChars.find(c) != std::string::npos) {
+                flush();
+            } else {
+                current += c;
+            }
+        }
+        flush();
+        // 限长避免 LIKE 过慢
+        if (best.size() > 32) best = best.substr(0, 32);
+        return best;
     }
 
     // 按标题模糊搜索（非全文索引，走 LIKE）
