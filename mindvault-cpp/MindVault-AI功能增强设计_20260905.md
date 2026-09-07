@@ -774,3 +774,16 @@ score(note_id) = Σ 1 / (60 + rank)
 ### 16.5 面试核心难点
 
 **图谱问答的"结构化 vs 非结构化"分路路由**：用关键词正则做路由判定（非结构化优先级高），结构化路纯SQL查link_edges不调AI（毫秒级），非结构化路把关联笔记摘要作为上下文喂给LLM。实现中遇到ExtractNoteName死循环bug（remove_words列表含空格导致find总能命中、replace无变化），修复后结构化路从假死超时恢复正常。这个设计的面试亮点是"结构化数据走SQL、非结构化走LLM"的分路思想，以及"不用AI做路由、用关键词正则省一次调用"的工程权衡。
+
+## 十七、P0-3.2 引用溯源已实现记录（实现日期 2026-09-07）
+
+### 17.1 本批改动文件清单
+- 后端 src/routes/ai_routes.h：/api/ai/chat/stream 的 done 事件新增携带 sources（检索结果数组，含 id/title/folder/title_highlight/content_highlight），与 /api/ai/chat 非流式响应对齐
+- 前端 web/src/api.ts：ChatMessage 增加可选 sources 字段；StreamCallbacks.onDone 增加第三参 sources；SSE 解析 done 事件透传
+- 前端 web/src/components/AIChatPanel.vue：assistant 消息下方渲染「📎 参考来源」chips（标题可点击）；新增 selectNote emit
+- 前端 web/src/App.vue：AIChatPanel 接入 @select-note → selectNote（点击来源跳转打开笔记）
+- 顺手修复两个存量前端 bug：api.ts getRecommendations URL 模板字符串丢反引号（请求路径错误）、BacklinksPanel.vue v-else-if 误接 v-else 后（Vue 语法错误致 vite build 失败）
+
+### 17.2 验证结果（2026-09-07 自测）
+- 前端 vue-tsc -b 类型检查通过；npm run build 通过（修复前 vite build 失败）
+- 后端 MSVC Release 编译通过
