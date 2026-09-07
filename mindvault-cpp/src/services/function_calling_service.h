@@ -174,7 +174,8 @@ private:
                 item["id"] = r.value("id", (int64_t)0);
                 item["title"] = r.value("title", std::string(""));
                 std::string snippet = r.value("content_highlight", std::string(""));
-                if (snippet.length() > 200) snippet = snippet.substr(0, 200) + "...";
+                // 工具模式的 snippet 给 600 字（普通模式的 3 倍），让 AI 一次看到足够多的内容
+                if (snippet.length() > 600) snippet = snippet.substr(0, 600) + "...";
                 item["snippet"] = snippet;
                 truncated.push_back(item);
             }
@@ -195,8 +196,8 @@ private:
             result["id"] = note.value("id", (int64_t)0);
             result["title"] = note.value("title", std::string(""));
             std::string content = note.value("content", std::string(""));
-            // 内容截断防 prompt 超长
-            if (content.length() > 1000) content = content.substr(0, 1000) + "...";
+            // 工具模式：3000 字上限（约 2000 token），给 AI 足够上下文（普通模式 RAG 注入了 1200 字/篇）
+            if (content.length() > 3000) content = content.substr(0, 3000) + "\n\n... (后续内容省略，请让 AI 用 search_notes 工具检索其他笔记，或分批询问)";
             result["content"] = content;
             return result;
         }
