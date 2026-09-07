@@ -145,6 +145,8 @@ export interface ChatMessage {
   created_at: string
   /** P0-3.2 引用溯源：assistant 回答对应的检索来源（仅当轮实时返回，历史会话记录中无此字段） */
   sources?: SearchResult[]
+  /** 智谱思考模型：模型的思考过程（仅当轮实时返回，历史会话记录中无此字段） */
+  reasoning?: string
 }
 
 export interface ChatRequest {
@@ -192,6 +194,7 @@ export const conversationsApi = {
 
 export interface StreamCallbacks {
   onDelta: (delta: string) => void
+  onReasoning?: (delta: string) => void  // 智谱思考模型：思考过程增量（折叠展示）
   onDone: (messageId: number, tokens: number, sources?: SearchResult[]) => void
   onError: (error: string) => void
 }
@@ -272,6 +275,9 @@ export async function chatStream(
           const data = JSON.parse(dataStr)
           if (data.type === 'delta') {
             callbacks.onDelta(data.content || '')
+          } else if (data.type === 'reasoning') {
+            // 智谱思考模型：思考过程（前端折叠展示）
+            callbacks.onReasoning?.(data.content || '')
           } else if (data.type === 'done') {
             callbacks.onDone(data.message_id || 0, data.tokens || 0, data.sources as SearchResult[] | undefined)
           } else if (data.type === 'error') {

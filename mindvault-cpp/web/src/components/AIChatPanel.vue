@@ -279,6 +279,11 @@ async function sendMessage() {
           assistantMsg.content += delta
           scrollToBottom()
         },
+        onReasoning: (delta: string) => {
+          // 智谱思考模型：实时累积思考过程到 assistantMsg.reasoning
+          assistantMsg.reasoning = (assistantMsg.reasoning || '') + delta
+          // 思考过程不自动滚动（避免和正文抢位置），用户主动展开查看
+        },
         onDone: (messageId: number, tokens: number, sources?: SearchResult[]) => {
           if (messageId > 0) assistantMsg.id = messageId
           if (tokens > 0) assistantMsg.tokens = tokens
@@ -464,6 +469,11 @@ function relativeTime(dateStr: string): string {
                     class="ai-message"
                     :class="msg.role"
                   >
+                    <!-- 智谱思考模型：思考过程（折叠展示，仅当轮实时） -->
+                    <details v-if="msg.role === 'assistant' && msg.reasoning" class="msg-reasoning">
+                      <summary>💭 思考过程</summary>
+                      <pre class="reasoning-content">{{ msg.reasoning }}</pre>
+                    </details>
                     <div class="msg-content">
                       {{ msg.content }}<span v-if="isStreaming && msg.role === 'assistant' && messages.length > 0 && msg.id === messages[messages.length - 1].id" class="stream-cursor"></span>
                     </div>
@@ -873,6 +883,44 @@ function relativeTime(dateStr: string): string {
 
 .ai-message.user .msg-time { text-align: right; margin-left: 40px; }
 .ai-message.assistant .msg-time { text-align: left; margin-right: 40px; }
+
+/* ─── 智谱思考模型：思考过程（折叠展示） ─── */
+.msg-reasoning {
+  margin: 0 40px 8px 0;
+  padding: 6px 12px;
+  background: rgba(137, 180, 250, 0.08);
+  border-left: 3px solid var(--accent, #89b4fa);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+.msg-reasoning summary {
+  cursor: pointer;
+  color: var(--text-muted, #888);
+  user-select: none;
+  list-style: none;
+  font-weight: 500;
+}
+.msg-reasoning summary:hover { color: var(--text-secondary, #aaa); }
+.msg-reasoning summary::before {
+  content: '▸ ';
+  display: inline-block;
+  transition: transform 0.15s;
+}
+.msg-reasoning[open] summary::before { content: '▾ '; }
+.reasoning-content {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted, #999);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  max-height: 320px;
+  overflow-y: auto;
+}
 
 /* ─── P0-3.2 引用溯源：来源列表 ─── */
 .msg-sources {

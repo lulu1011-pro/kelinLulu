@@ -256,16 +256,20 @@ inline bool HttpPostStream(const std::wstring& host, int port, const std::wstrin
 
 // SSE 解析器：处理 OpenAI 兼容的流式响应（data: {...}\n\n）
 // 维护内部缓冲区，支持逐块喂入
+// 兼容智谱思考模型：除 content 外还读取 reasoning_content（深度思考过程）
 class SSEParser {
 public:
-    void feed(const char* data, size_t len, std::function<void(const std::string& delta)> onDelta) {
+    using DeltaCallback = std::function<void(const std::string&)>;
+    using ReasoningCallback = std::function<void(const std::string&)>;
+
+    void feed(const char* data, size_t len, DeltaCallback onDelta, ReasoningCallback onReasoning = nullptr) {
         buffer_.append(data, len);
         size_t pos;
         // SSE 事件以空行（\n\n）分隔
         while ((pos = buffer_.find("\n\n")) != std::string::npos) {
             std::string event = buffer_.substr(0, pos);
             buffer_.erase(0, pos + 2);
-            parseEvent(event, onDelta);
+            parseEvent(event, onDelta, onReasoning);
         }
     }
 
@@ -277,7 +281,7 @@ private:
     bool done_ = false;
     int completionTokens_ = 0;
 
-    void parseEvent(const std::string& event, std::function<void(const std::string& delta)> onDelta) {
+    void parseEvent(const std::string& event, DeltaCallback onDelta, ReasoningCallback onReasoning) {
         size_t dataPos = event.find("data: ");
         if (dataPos == std::string::npos) return;
         std::string dataStr = event.substr(dataPos + 6);
@@ -293,10 +297,17 @@ private:
             auto j = nlohmann::json::parse(dataStr);
             if (j.contains("choices") && j["choices"].size() > 0) {
                 auto& choice = j["choices"][0];
-                // OpenAI 格式：choices[0].delta.content
-                if (choice.contains("delta") && choice["delta"].contains("content")) {
-                    std::string delta = choice["delta"]["content"].get<std::string>();
-                    if (!delta.empty()) onDelta(delta);
+                if (choice.contains("delta")) {
+                    // OpenAI 格式：choices[0].delta.content
+                    if (choice["delta"].contains("content") && !choice["delta"]["content"].is_null()) {
+                        std::string delta = choice["delta"]["content"].get<std::string>();
+                        if (!delta.empty() && onDelta) onDelta(delta);
+                    }
+                    // 智谱思考模型：choices[0].delta.reasoning_content（深度思考过程）
+                    if (choice["delta"].contains("reasoning_content") && !choice["delta"]["reasoning_content"].is_null()) {
+                        std::string reasoning = choice["delta"]["reasoning_content"].get<std::string>();
+                        if (!reasoning.empty() && onReasoning) onReasoning(reasoning);
+                    }
                 }
                 // 部分 API 把 usage 放在 choice 里
                 if (choice.contains("usage") && choice["usage"].contains("completion_tokens"))
@@ -311,19 +322,22 @@ private:
 
 // 流式调用结果
 struct StreamResult {
-    std::string fullContent;
+    std::string fullContent;        // 模型正文回答
+    std::string fullReasoning;      // 模型思考过程（智谱思考模型专用）
     int completionTokens = 0;
     bool success = false;
     std::string error;
 };
 
 // 流式调用在线 API：整合 HttpPostStream + SSEParser
-// onDelta: 每收到一个内容增量就调用
+// onDelta: 每收到一个内容增量就调用（正文）
+// onReasoning: 每收到一个推理增量就调用（思考过程，可选）
 // shouldAbort: 检查是否需要中止（客户端断开时返回 true）
 inline StreamResult CallOnlineAPIStream(
     const std::string& api_url, const std::string& api_key, const std::string& model,
     const nlohmann::json& messages,
     std::function<void(const std::string& delta)> onDelta,
+    std::function<void(const std::string& delta)> onReasoning = nullptr,
     std::function<bool()> shouldAbort = []() { return false; }) {
     StreamResult result;
 
@@ -348,21 +362,29 @@ inline StreamResult CallOnlineAPIStream(
 
     SSEParser parser;
     std::string fullContent;
+    std::string fullReasoning;
 
     bool ok = HttpPostStream(host, port, path, reqBody.dump(), api_key,
         [&](const char* data, size_t len) -> bool {
             if (shouldAbort()) return false;
-            parser.feed(data, len, [&](const std::string& delta) {
-                fullContent += delta;
-                onDelta(delta);
-            });
+            parser.feed(data, len,
+                [&](const std::string& delta) {
+                    fullContent += delta;
+                    if (onDelta) onDelta(delta);
+                },
+                [&](const std::string& reasoning) {
+                    fullReasoning += reasoning;
+                    if (onReasoning) onReasoning(reasoning);
+                });
             return !parser.done();
         });
 
     result.fullContent = fullContent;
+    result.fullReasoning = fullReasoning;
     result.completionTokens = parser.completionTokens();
-    result.success = ok && !fullContent.empty();
-    if (!result.success && fullContent.empty()) result.error = "Stream returned empty content";
+    // 成功判定：HTTP 成功且 content 或 reasoning 任一非空
+    result.success = ok && (!fullContent.empty() || !fullReasoning.empty());
+    if (!result.success) result.error = "Stream returned empty content";
     return result;
 }
 #endif
@@ -842,6 +864,7 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
 
             std::string systemPrompt = "你是一个知识库助手。请基于参考资料回答问题。如果资料无法回答，请明确说明。";
             std::string answer;
+            std::string savedReasoning;  // 智谱思考模型：把 reasoning 提到 #ifdef 外供保存使用
             int64_t msgId = 0;
             int completionTokens = 0;
 
@@ -934,10 +957,17 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
                         nlohmann::json evt = {{"type", "delta"}, {"content", delta}};
                         res.stream_sink_("data: " + evt.dump() + "\n\n");
                     },
+                    [&](const std::string& reasoning) {
+                        // 智谱思考模型：将推理过程作为独立事件推给前端（折叠展示）
+                        nlohmann::json evt = {{"type", "reasoning"}, {"content", reasoning}};
+                        res.stream_sink_("data: " + evt.dump() + "\n\n");
+                    },
                     [&]() -> bool { return aborted.load(); }
                 );
                 answer = sr.fullContent;
                 completionTokens = sr.completionTokens;
+                // 把 reasoning 提到 #ifdef 外保存用
+                savedReasoning = sr.fullReasoning;
                 if (!sr.success && !aborted.load()) {
                     nlohmann::json errEvt = {{"type", "error"}, {"message", sr.error.empty() ? "API 请求失败" : sr.error}};
                     res.stream_sink_("data: " + errEvt.dump() + "\n\n");
@@ -952,6 +982,14 @@ inline void RegisterAIRoutes(crow::App<>& app, Database& db) {
 #endif
 
             // 7. 写入 assistant 消息（即使客户端断开也写入）
+            // 智谱思考模型：若只有 reasoning 没有 content，把 reasoning 也保存（重读时可见）
+            // 注：sr 作用域限制在 #ifdef 块内，这里通过 savedReasoning 变量传递
+            if (!answer.empty() && !savedReasoning.empty()) {
+                answer = "💭 [思考过程]\n" + savedReasoning + "\n\n" + answer;
+            }
+            if (answer.empty() && !savedReasoning.empty() && !aborted.load()) {
+                answer = "💭 [模型仅返回思考过程，未给出正文回答]\n\n" + savedReasoning;
+            }
             if (answer.empty() && !aborted.load()) {
                 answer = "无法获取 AI 回答。请检查 API Key 和网络连接。\n\n以下是 RAG 检索结果：\n\n" + ragContext;
             }
