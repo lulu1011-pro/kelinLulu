@@ -383,6 +383,7 @@ function relativeTime(dateStr: string): string {
                 <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name }}</option>
               </select>
               <select v-model="selectedModel" class="model-select">
+                <option v-if="getModels().length === 0 && selectedModel" :value="selectedModel">{{ selectedModel }}</option>
                 <option v-for="m in getModels()" :key="m" :value="m">{{ m }}</option>
               </select>
               <button class="btn-settings" @click="showSettings = !showSettings" title="API 设置">⚙️</button>
