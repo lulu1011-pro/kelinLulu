@@ -29,9 +29,12 @@
 面向个人知识管理场景，设计并开发本地优先的知识库系统，支持 Markdown 编辑、
 Wiki 双向链接、FTS5 全文检索。采用 C++ 后端 + Vue3 前端架构，
 通过 REST API 前后端分离，实现高效的知识管理体验。
+在知识库之上构建 AI 增强层：多用户会话式 RAG 问答、SSE 流式输出、
+混合检索（FTS5 + 向量）、Query 改写、引用溯源、内容创作套件、图谱问答。
 
 ### 技术栈
-**后端**: C++17、Crow、SQLite3 (FTS5)、nlohmann/json、CMake
+**后端**: C++17、Crow、SQLite3 (FTS5)、nlohmann/json、WinHTTP、CMake
+**AI**: OpenAI 兼容 API（通义/豆包/OpenAI/Ollama）、SSE 流式、向量 embedding、function calling
 **前端**: Vue 3、TypeScript、Vite、CodeMirror 6、marked、turndown
 
 ### 主要工作
@@ -65,10 +68,31 @@ Wiki 双向链接、FTS5 全文检索。采用 C++ 后端 + Vue3 前端架构，
    - 开发递归文件夹树组件（FolderTree.vue）、笔记大纲（OutlinePanel.vue）
    - 实现 Ctrl+K 全局搜索弹框、HTML→Markdown 转换、PDF 导出
 
+6、设计 AI 会话式 RAG 问答层（多轮记忆 + 混合检索）
+   - 设计 ai_conversations / ai_messages 两张表，支持会话 CRUD 与消息持久化；会话级互斥锁防并发写串
+   - 上下文管理：固定轮次上限（10 轮）+ 字符级 token 预算截断（从最旧消息丢，系统提示与当前问题永不丢），API 返回 usage 后校准入库
+   - Query 改写：取最近 2 轮历史 + 当前问题调用模型，消解"它/那个方案"类指代生成独立检索词，失败自动降级原问题
+   - 混合检索：笔记切块（标题→段落→800 字符窗口+50 字重叠+句子边界对齐）→ embedding（WinHTTP，3 秒超时）→ FTS5 关键词路 + 向量余弦路双路召回 → RRF 融合排序（k=60）；embedding 失败自动降级纯 FTS5
+   - 引用溯源：回答响应携带检索来源（sources），前端按来源渲染可点击引用，点击跳转打开对应笔记
+
+7、实现 SSE 流式输出与 AI 创作工具链
+   - 为 Crow 框架打补丁扩展直写 socket 能力（response.stream_sink_/stream_close_），新增 /api/ai/chat/stream 端点手动写 HTTP 头、逐块推送 SSE，客户端断开检测防崩溃
+   - 前端用 fetch + ReadableStream 解析 SSE 逐字渲染，支持 AbortController 取消、错误提示与重试
+   - 内容创作统一接口：润色/扩写/总结/翻译/大纲/自动标签 6 类 action，模型输出 JSON 结构化提取 + 容错（去代码块围栏/截花括号/重试一次/降级纯文本）
+   - 自动标签只从已有标签集合中选取（防标签爆炸），建议新标签单独返回不入库
+   - 关联推荐：link_edges 双向链接强信号 + 向量余弦弱信号加权融合（两路命中排最前）
+
+8、实现图谱问答与 function calling
+   - 知识图谱问答：关键词正则做路由判定，结构化问题（"A 链接到哪些笔记"）纯 SQL 查 link_edges 不调 AI，非结构化问题把关联笔记摘要喂 LLM，三层降级兜底
+   - 轻量 function calling：定义 search_notes / get_note 两个真实只读工具映射到既有 Service，单轮 tool loop，工具失败自动降级普通对话
+   - 前端：知识图谱面板内嵌问答，AI 聊天面板增加工具模式开关，实时展示工具调用参数与状态
+
 ### 项目成果
-- 17 个 REST API，覆盖笔记 CRUD、全文搜索、Wiki 链接、标签、文件导入导出
+- 60+ REST API，覆盖笔记 CRUD、全文搜索、Wiki 链接、标签、多用户会话、AI 问答等
 - FTS5 全文搜索响应时间 < 50ms（万级笔记）
-- 完整的前端交互：文件夹树、编辑器、大纲、反向链接、搜索、回收站
+- 会话式 RAG 问答：多轮记忆 + 混合检索（FTS5+向量 RRF 融合）+ Query 改写 + 引用溯源
+- AI 全链路对接 OpenAI 兼容 API：SSE 流式输出、usage token 校准、内容创作 6 类 action
+- 完整的前端交互：文件夹树、编辑器、大纲、反向链接、搜索、回收站、AI 面板、知识图谱
 - Tokyo Night 主题 + CSS 变量系统 + 过渡动画
 
 ---
@@ -99,3 +123,37 @@ A: "当然，只是慢一些。AI 省的是我查文档和写样板代码的时�
 像 SQLite C API 的回调风格我本来就熟悉，Crow 的路由语法我花半天就学会了。
 AI 的价值是让我把精力集中在架构设计和逻辑验证上，而不是在格式化 JSON
 这种重复劳动上。"
+
+### Q: "详细讲讲你项目里的 RAG 问答是怎么设计的？"
+A: "核心是四件事。第一，多轮记忆：我有 ai_conversations 和 ai_messages
+两张表，每次对话先查历史拼上下文，但历史不能无限长，我做两层控制，
+固定保留最近 10 轮，另外按字符粗估 token 预算，从最老的开始丢，
+系统提示和当前问题永远不丢，模型返回 usage 字段后我再校准一次。
+第二，检索质量：直接拿用户问题去搜效果不好，因为口语里有指代，
+所以我先用最近两轮历史加当前问题做一次 Query 改写，把'它和微调有什么区别'
+改写成完整的独立问题再检索；检索本身是混合的，FTS5 关键词一条路，
+向量 embedding 一条路，用 RRF 把两路排名融合。第三，溯源：
+回答里我会带上检索来源的笔记 id 和标题，前端展示成可点击的引用，
+这是为了防幻觉，用户能自己去核对原文。第四，工程兜底：
+embedding 服务超时或失败就自动降级成纯 FTS5，AI 调用失败也有降级文案，
+保证功能永远可用。"
+
+### Q: "为什么用 RRF 而不是直接加权平均做检索融合？"
+A: "两个原因。一是量纲问题，FTS5 的 BM25 分数和向量余弦相似度
+根本不在一个尺度上，直接加权平均没法调权重；RRF 只看排名不看分数，
+用 1/(k+rank) 这种形式把两路结果拉回同一套比较逻辑，k 取 60。
+二是我在实现里验证过：embedding 偶尔会超时失败，RRF 天然支持单路降级，
+一路挂了另一路照常出结果，加权平均反而要额外处理缺路的情况。
+面试官如果追问混合检索没召回怎么办，我的回答是 Query 改写本身就是
+第一道召回优化，改写后还搜不到就明确告诉用户知识库里没有。"
+
+### Q: "SSE 流式输出你在 C++ 里是怎么做的？"
+A: "Crow 这个框架本身没有流式能力，它的响应是攒完一次发。
+我先看了 Crow 源码，发现底层 socket 写是暴露的，就给 response 打了补丁，
+扩展出 stream_sink_ 和 stream_close_ 两个成员，一个往 socket 直写一块数据，
+一个关连接。有了这个基础，我手动写 HTTP 响应头，Content-Type 设成
+text/event-stream，然后按 SSE 协议逐块推 data: {...} 事件，每条消息
+以空行结尾。流的生命周期管理是关键，客户端可能中途关页面，我加了一个
+atomic 的 aborted 标志，推流时检查，检测到断开就停，不然 socket 写会
+抛异常崩溃，这个 bug 我实际踩到过。前端用 fetch 加 ReadableStream
+逐块读，不支持 EventSource 是因为它只能发 GET 而我的接口是 POST。"
