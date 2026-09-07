@@ -83,7 +83,7 @@ watch(() => props.noteId, loadLinks, { immediate: true })
       </div>
     </div>
 
-    <div v-else class="link-list">
+    <div v-else-if="activeTab === 'forward'" class="link-list">
       <div v-if="forwardLinks.length === 0" class="empty-links">
         <span class="empty-icon">🔗</span>
         <p>暂无正向链接</p>
@@ -104,7 +104,7 @@ watch(() => props.noteId, loadLinks, { immediate: true })
     </div>
 
     <!-- ─── P1-7 关联推荐 ─── -->
-    <div v-else-if="activeTab === 'rec'" class="link-list">
+    <div v-else class="link-list">
       <div v-if="recLoading" class="panel-loading">加载中...</div>
       <div v-else-if="recommendations.length === 0" class="empty-links">
         <span class="empty-icon">✨</span>

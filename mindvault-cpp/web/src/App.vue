@@ -482,6 +482,7 @@ onBeforeUnmount(() => {
     <AIChatPanel
       :visible="showAIChat"
       @close="showAIChat = false"
+      @select-note="selectNote"
     />
 
     <!-- 知识图谱 -->

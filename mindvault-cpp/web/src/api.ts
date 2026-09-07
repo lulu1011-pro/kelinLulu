@@ -143,6 +143,8 @@ export interface ChatMessage {
   content: string
   tokens: number
   created_at: string
+  /** P0-3.2 引用溯源：assistant 回答对应的检索来源（仅当轮实时返回，历史会话记录中无此字段） */
+  sources?: SearchResult[]
 }
 
 export interface ChatRequest {
@@ -190,7 +192,7 @@ export const conversationsApi = {
 
 export interface StreamCallbacks {
   onDelta: (delta: string) => void
-  onDone: (messageId: number, tokens: number) => void
+  onDone: (messageId: number, tokens: number, sources?: SearchResult[]) => void
   onError: (error: string) => void
 }
 
@@ -271,7 +273,7 @@ export async function chatStream(
           if (data.type === 'delta') {
             callbacks.onDelta(data.content || '')
           } else if (data.type === 'done') {
-            callbacks.onDone(data.message_id || 0, data.tokens || 0)
+            callbacks.onDone(data.message_id || 0, data.tokens || 0, data.sources as SearchResult[] | undefined)
           } else if (data.type === 'error') {
             callbacks.onError(data.message || '服务端错误')
           }
@@ -496,7 +498,7 @@ export async function aiAction(
 
 // 关联笔记推荐：link_edges 强信号 + 向量弱信号融合
 export async function getRecommendations(noteId: number): Promise<Recommendation[]> {
-  return request<Recommendation[]>(/notes//recommendations)
+  return request<Recommendation[]>(`/notes/${noteId}/recommendations`)
 }
 
 

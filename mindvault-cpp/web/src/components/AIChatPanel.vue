@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, nextTick } from 'vue'
-import { conversationsApi, chatStream, chatWithTools, type Conversation, type ChatMessage, type ChatWithToolsResult, type ToolCall } from '../api'
+import { conversationsApi, chatStream, chatWithTools, type Conversation, type ChatMessage, type ChatWithToolsResult, type ToolCall, type SearchResult, type Note } from '../api'
 
 interface Provider {
   id: string
@@ -15,6 +15,8 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: []
+  /** P0-3.2 引用溯源：点击来源笔记跳转打开 */
+  selectNote: [note: Note]
 }>()
 
 // ─── 会话状态 ───
@@ -277,9 +279,11 @@ async function sendMessage() {
           assistantMsg.content += delta
           scrollToBottom()
         },
-        onDone: (messageId: number, tokens: number) => {
+        onDone: (messageId: number, tokens: number, sources?: SearchResult[]) => {
           if (messageId > 0) assistantMsg.id = messageId
           if (tokens > 0) assistantMsg.tokens = tokens
+          // P0-3.2 引用溯源：保存检索来源供下方渲染
+          if (sources && sources.length > 0) assistantMsg.sources = sources
         },
         onError: (error: string) => {
           streamError.value = error
@@ -339,6 +343,11 @@ function retryLast() {
 function scrollToBottom() {
   const el = document.querySelector('.ai-messages')
   if (el) el.scrollTop = el.scrollHeight
+}
+
+// P0-3.2 引用溯源：点击来源笔记，通知父组件打开
+function openSource(src: SearchResult) {
+  emit('selectNote', { id: src.id, title: src.title, folder: src.folder || '' } as Note)
 }
 
 function onKeydown(e: KeyboardEvent) {
@@ -452,6 +461,22 @@ function relativeTime(dateStr: string): string {
                   >
                     <div class="msg-content">
                       {{ msg.content }}<span v-if="isStreaming && msg.role === 'assistant' && messages.length > 0 && msg.id === messages[messages.length - 1].id" class="stream-cursor"></span>
+                    </div>
+                    <!-- P0-3.2 引用溯源：来源笔记列表（点击跳转） -->
+                    <div v-if="msg.role === 'assistant' && msg.sources && msg.sources.length > 0" class="msg-sources">
+                      <div class="sources-title">📎 参考来源 ({{ msg.sources.length }})</div>
+                      <div class="sources-list">
+                        <button
+                          v-for="(src, i) in msg.sources"
+                          :key="src.id"
+                          class="source-chip"
+                          :title="src.content_highlight ? src.content_highlight.replace(/>>>|<<</g, '') : src.title"
+                          @click="openSource(src)"
+                        >
+                          <span class="source-idx">[{{ i + 1 }}]</span>
+                          {{ src.title }}
+                        </button>
+                      </div>
                     </div>
                     <div class="msg-time">{{ relativeTime(msg.created_at) }}</div>
                   </div>
@@ -843,6 +868,53 @@ function relativeTime(dateStr: string): string {
 
 .ai-message.user .msg-time { text-align: right; margin-left: 40px; }
 .ai-message.assistant .msg-time { text-align: left; margin-right: 40px; }
+
+/* ─── P0-3.2 引用溯源：来源列表 ─── */
+.msg-sources {
+  margin: 6px 40px 0 0;
+  padding: 8px 12px;
+  background: var(--bg-hover);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm);
+}
+.sources-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.sources-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.source-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all var(--duration-fast);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.source-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-glow);
+}
+.source-idx {
+  color: var(--accent);
+  font-weight: 600;
+  flex-shrink: 0;
+}
 
 /* ─── 输入区 ─── */
 .ai-input-area {
